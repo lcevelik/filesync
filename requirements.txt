@@ -1,1 +1,2 @@
 pyinstaller>=6.0
+xxhash>=3.0       # optional: 3-5x faster hashing than sha256 (falls back automatically)

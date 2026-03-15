@@ -2,6 +2,7 @@
 FileSync - Precision file synchronization tool
 Designed for Unreal Engine projects (and any large file trees)
 Supports multiple destinations.
+GUI: Kivy
 """
 
 import os
@@ -10,28 +11,52 @@ import hashlib
 import shutil
 import threading
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+
+# ── Kivy: suppress verbose startup log ────────────────────────────
+os.environ.setdefault('KIVY_NO_ENV_CONFIG', '1')
+os.environ.setdefault('KIVY_LOG_LEVEL', 'warning')
+
+import kivy
+kivy.require('2.0.0')
+
+from kivy.app import App
+from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.button import Button
+from kivy.uix.label import Label
+from kivy.uix.textinput import TextInput
+from kivy.uix.checkbox import CheckBox
+from kivy.uix.progressbar import ProgressBar
+from kivy.uix.popup import Popup
+from kivy.uix.filechooser import FileChooserListView
+from kivy.uix.recycleview import RecycleView
+from kivy.uix.recycleview.views import RecycleDataViewBehavior
+from kivy.uix.recycleboxlayout import RecycleBoxLayout
+from kivy.properties import StringProperty, ListProperty
+from kivy.clock import Clock
+from kivy.graphics import Color, Rectangle
+from kivy.core.window import Window
+from kivy.lang import Builder
+from kivy.metrics import dp, sp
 
 # ─────────────────────────────────────────────
 # Data model
 # ─────────────────────────────────────────────
 
 class FileStatus(Enum):
-    NEW        = "New"        # in source, missing from this dest
-    MODIFIED   = "Modified"   # in both, content differs
-    UNCHANGED  = "Unchanged"  # in both, identical
-    DEST_ONLY  = "Dest Only"  # in dest only, not in source
+    NEW        = "New"
+    MODIFIED   = "Modified"
+    UNCHANGED  = "Unchanged"
+    DEST_ONLY  = "Dest Only"
 
 
 @dataclass
 class DestStatus:
-    """Per-destination comparison result for one file."""
     dest_index: int
     status: FileStatus = FileStatus.UNCHANGED
     dst_path: Optional[Path] = None
@@ -42,17 +67,15 @@ class DestStatus:
 
 @dataclass
 class FileEntry:
-    """A single file's comparison result across all destinations."""
     rel_path: str
     src_path: Optional[Path] = None
     src_size: int = 0
     src_mtime: float = 0.0
     src_hash: Optional[str] = None
-    dest_statuses: list = field(default_factory=list)   # list[DestStatus]
+    dest_statuses: list = field(default_factory=list)
 
     @property
     def overall_status(self) -> FileStatus:
-        """Worst-case status across all destinations."""
         statuses = {ds.status for ds in self.dest_statuses}
         for s in (FileStatus.NEW, FileStatus.MODIFIED, FileStatus.DEST_ONLY):
             if s in statuses:
@@ -68,7 +91,6 @@ class FileEntry:
                 if ds.status != FileStatus.UNCHANGED]
 
     def dest_label(self) -> str:
-        """e.g. 'D1, D3' showing which destinations need this file."""
         idxs = self.dests_needing_sync()
         if not idxs:
             return ""
@@ -79,23 +101,40 @@ class FileEntry:
 # Core engine
 # ─────────────────────────────────────────────
 
-def compute_hash(path: Path, chunk_size: int = 1 << 20) -> str:
-    """SHA-256 of file content (1 MB chunks for large UE assets)."""
-    h = hashlib.sha256()
-    try:
-        with open(path, "rb") as f:
-            while True:
-                chunk = f.read(chunk_size)
-                if not chunk:
-                    break
-                h.update(chunk)
-    except (PermissionError, OSError):
-        return ""
-    return h.hexdigest()
+_IO_WORKERS = min(16, (os.cpu_count() or 4) * 2)
+
+try:
+    import xxhash as _xxhash
+    def compute_hash(path: Path, chunk_size: int = 1 << 20) -> str:
+        h = _xxhash.xxh3_64()
+        try:
+            with open(path, "rb") as f:
+                while True:
+                    chunk = f.read(chunk_size)
+                    if not chunk:
+                        break
+                    h.update(chunk)
+        except (PermissionError, OSError):
+            return ""
+        return h.hexdigest()
+    _HASH_ALGO = "xxh3_64"
+except ImportError:
+    def compute_hash(path: Path, chunk_size: int = 1 << 20) -> str:
+        h = hashlib.sha256()
+        try:
+            with open(path, "rb") as f:
+                while True:
+                    chunk = f.read(chunk_size)
+                    if not chunk:
+                        break
+                    h.update(chunk)
+        except (PermissionError, OSError):
+            return ""
+        return h.hexdigest()
+    _HASH_ALGO = "sha256"
 
 
 def build_file_index(root: Path, excludes: list) -> dict:
-    """Walk a directory → {rel_path: {path, size, mtime}}."""
     index = {}
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [
@@ -115,57 +154,92 @@ def build_file_index(root: Path, excludes: list) -> dict:
 
 def diff_trees_multi(
     src_root: Path,
-    dst_roots: list,          # list[Path]
+    dst_roots: list,
     excludes: list,
     use_hash: bool,
     progress_cb=None,
     cancel_event=None,
 ) -> list:
-    """
-    Compare source against all destinations.
-    Source hash is computed once per file and reused across destinations.
-    Returns list[FileEntry].
-    """
     if progress_cb:
-        progress_cb(0, 1, "Scanning source…")
-    src_index = build_file_index(src_root, excludes)
+        progress_cb(0, 1, "Scanning directories…")
 
-    dst_indices = []
-    for i, dst_root in enumerate(dst_roots):
-        if progress_cb:
-            progress_cb(0, 1, f"Scanning destination {i+1}…")
-        if dst_root.exists():
-            dst_indices.append(build_file_index(dst_root, excludes))
-        else:
-            dst_indices.append({})
+    scan_targets = [(0, src_root)] + [(i + 1, d) for i, d in enumerate(dst_roots)]
+    scan_results = [None] * len(scan_targets)
 
-    # Union of all paths
+    def _scan(idx, root):
+        return idx, build_file_index(root, excludes) if root.exists() else {}
+
+    with ThreadPoolExecutor(max_workers=min(len(scan_targets), _IO_WORKERS)) as ex:
+        for fut in as_completed(ex.submit(_scan, idx, root) for idx, root in scan_targets):
+            if cancel_event and cancel_event.is_set():
+                break
+            idx, result = fut.result()
+            scan_results[idx] = result
+
+    src_index   = scan_results[0] or {}
+    dst_indices = [scan_results[i + 1] or {} for i in range(len(dst_roots))]
+
     all_keys = set(src_index)
     for idx in dst_indices:
         all_keys |= set(idx)
-
-    results = []
     total = len(all_keys)
 
+    hash_cache: dict = {}
+
+    if use_hash:
+        if progress_cb:
+            progress_cb(0, total, "Pre-hashing files…")
+
+        paths_to_hash: set = set()
+        for rel in all_keys:
+            src_info = src_index.get(rel)
+            if not src_info:
+                continue
+            for dst_index in dst_indices:
+                dst_info = dst_index.get(rel)
+                if dst_info and dst_info["size"] == src_info["size"]:
+                    paths_to_hash.add(src_info["path"])
+                    paths_to_hash.add(dst_info["path"])
+
+        n_hash = len(paths_to_hash)
+        done_hash = 0
+        with ThreadPoolExecutor(max_workers=_IO_WORKERS) as ex:
+            futures = {ex.submit(compute_hash, p): p for p in paths_to_hash}
+            for fut in as_completed(futures):
+                if cancel_event and cancel_event.is_set():
+                    break
+                path = futures[fut]
+                hash_cache[path] = fut.result()
+                done_hash += 1
+                if progress_cb and done_hash % 50 == 0:
+                    progress_cb(done_hash, n_hash,
+                                f"Hashing… ({done_hash}/{n_hash}, algo={_HASH_ALGO})")
+
+    if progress_cb:
+        progress_cb(0, total, "Comparing…")
+
+    results = []
     for i, rel in enumerate(sorted(all_keys)):
         if cancel_event and cancel_event.is_set():
             break
-        if progress_cb:
-            progress_cb(i, total, f"Comparing: {rel}")
+        if progress_cb and i % 500 == 0:
+            progress_cb(i, total, f"Comparing… ({i}/{total})")
 
         src_info = src_index.get(rel, {})
-        in_src = rel in src_index
+        in_src   = rel in src_index
+        src_path = src_info.get("path")
 
         entry = FileEntry(
             rel_path=rel,
-            src_path=src_info.get("path"),
+            src_path=src_path,
             src_size=src_info.get("size", 0),
             src_mtime=src_info.get("mtime", 0.0),
+            src_hash=hash_cache.get(src_path) if src_path else None,
         )
 
         for dest_i, dst_index in enumerate(dst_indices):
             dst_info = dst_index.get(rel, {})
-            in_dst = rel in dst_index
+            in_dst   = rel in dst_index
 
             ds = DestStatus(
                 dest_index=dest_i,
@@ -176,29 +250,21 @@ def diff_trees_multi(
 
             if in_src and not in_dst:
                 ds.status = FileStatus.NEW
-
             elif not in_src and in_dst:
                 ds.status = FileStatus.DEST_ONLY
-
             else:
-                # Both exist — compare
                 if entry.src_size != ds.dst_size:
                     ds.status = FileStatus.MODIFIED
                 elif use_hash:
-                    # Compute src hash once, reuse across destinations
-                    if entry.src_hash is None:
-                        entry.src_hash = compute_hash(entry.src_path)
-                    ds.dst_hash = compute_hash(ds.dst_path)
-                    if entry.src_hash != ds.dst_hash:
-                        ds.status = FileStatus.MODIFIED
-                    else:
-                        ds.status = FileStatus.UNCHANGED
+                    src_h = hash_cache.get(entry.src_path, "")
+                    dst_h = hash_cache.get(ds.dst_path, "")
+                    ds.dst_hash = dst_h or None
+                    ds.status = (FileStatus.MODIFIED
+                                 if src_h != dst_h else FileStatus.UNCHANGED)
                 else:
-                    # Fast mode: mtime ±2 s tolerance
-                    if abs(entry.src_mtime - ds.dst_mtime) > 2:
-                        ds.status = FileStatus.MODIFIED
-                    else:
-                        ds.status = FileStatus.UNCHANGED
+                    ds.status = (FileStatus.MODIFIED
+                                 if abs(entry.src_mtime - ds.dst_mtime) > 2
+                                 else FileStatus.UNCHANGED)
 
             entry.dest_statuses.append(ds)
 
@@ -211,7 +277,7 @@ def diff_trees_multi(
 
 def sync_files_multi(
     entries: list,
-    dst_roots: list,          # list[Path]
+    dst_roots: list,
     copy_new: bool = True,
     copy_modified: bool = True,
     delete_dest_only: bool = False,
@@ -219,58 +285,52 @@ def sync_files_multi(
     cancel_event=None,
     log_cb=None,
 ) -> dict:
-    """
-    Sync each file to every destination that needs it.
-    Returns stats dict per destination index.
-    """
-    stats = {i: {"copied": 0, "deleted": 0, "errors": 0}
-             for i in range(len(dst_roots))}
+    stats      = {i: {"copied": 0, "deleted": 0, "errors": 0} for i in range(len(dst_roots))}
+    stats_lock = threading.Lock()
+    done_count = 0
 
     to_process = [e for e in entries if e.needs_sync]
-    total = len(to_process)
+    total      = len(to_process)
 
-    for i, entry in enumerate(to_process):
+    def _sync_one(entry: FileEntry):
+        nonlocal done_count
         if cancel_event and cancel_event.is_set():
-            if log_cb:
-                log_cb("⚠ Sync cancelled by user.")
-            break
+            return
 
-        if progress_cb:
-            progress_cb(i, total, entry.rel_path)
-
-        copied_to = []
+        copied_to    = []
         deleted_from = []
+        local        = {i: {"copied": 0, "deleted": 0, "errors": 0} for i in range(len(dst_roots))}
 
         for ds in entry.dest_statuses:
             if ds.status == FileStatus.UNCHANGED:
                 continue
 
-            dst_root = dst_roots[ds.dest_index]
+            dst_root   = dst_roots[ds.dest_index]
             dest_label = f"D{ds.dest_index + 1}"
 
             try:
                 if ds.status == FileStatus.DEST_ONLY and delete_dest_only:
                     if ds.dst_path and ds.dst_path.exists():
                         ds.dst_path.unlink()
-                    stats[ds.dest_index]["deleted"] += 1
+                    local[ds.dest_index]["deleted"] += 1
                     deleted_from.append(dest_label)
 
                 elif ds.status in (FileStatus.NEW, FileStatus.MODIFIED):
                     if copy_new and ds.status == FileStatus.NEW:
-                        pass  # fall through to copy
+                        pass
                     elif copy_modified and ds.status == FileStatus.MODIFIED:
-                        pass  # fall through to copy
+                        pass
                     else:
                         continue
 
                     dest_path = dst_root / entry.rel_path
                     dest_path.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(entry.src_path, dest_path)
-                    stats[ds.dest_index]["copied"] += 1
+                    local[ds.dest_index]["copied"] += 1
                     copied_to.append(dest_label)
 
             except Exception as exc:
-                stats[ds.dest_index]["errors"] += 1
+                local[ds.dest_index]["errors"] += 1
                 if log_cb:
                     log_cb(f"  ERR [{dest_label}] {entry.rel_path} → {exc}")
 
@@ -280,609 +340,26 @@ def sync_files_multi(
         if deleted_from and log_cb:
             log_cb(f"  DEL  {entry.rel_path}  → {', '.join(deleted_from)}")
 
+        with stats_lock:
+            for i in range(len(dst_roots)):
+                for k in ("copied", "deleted", "errors"):
+                    stats[i][k] += local[i][k]
+            done_count += 1
+            if progress_cb:
+                progress_cb(done_count, total, entry.rel_path)
+
+    with ThreadPoolExecutor(max_workers=_IO_WORKERS) as ex:
+        futures = [ex.submit(_sync_one, entry) for entry in to_process]
+        for fut in as_completed(futures):
+            if cancel_event and cancel_event.is_set():
+                if log_cb:
+                    log_cb("⚠ Sync cancelled by user.")
+                break
+            fut.result()
+
     if progress_cb:
         progress_cb(total, total, "Done.")
     return stats
-
-
-# ─────────────────────────────────────────────
-# GUI
-# ─────────────────────────────────────────────
-
-UE_DEFAULT_EXCLUDES = [
-    "intermediate", "saved", "deriveddatacache",
-    "binaries", ".vs", ".git", "__pycache__",
-]
-
-PALETTE = {
-    "bg":      "#1e1e2e",
-    "surface": "#2a2a3e",
-    "border":  "#3a3a5a",
-    "accent":  "#7c9ef8",
-    "text":    "#cdd6f4",
-    "subtext": "#a6adc8",
-    "green":   "#a6e3a1",
-    "yellow":  "#f9e2af",
-    "red":     "#f38ba8",
-    "blue":    "#89b4fa",
-    "mantle":  "#181825",
-    "orange":  "#fab387",
-}
-
-STATUS_COLOR = {
-    FileStatus.NEW:       PALETTE["green"],
-    FileStatus.MODIFIED:  PALETTE["yellow"],
-    FileStatus.UNCHANGED: PALETTE["subtext"],
-    FileStatus.DEST_ONLY: PALETTE["red"],
-}
-
-
-class FileSyncApp(tk.Tk):
-    def __init__(self):
-        super().__init__()
-        self.title("FileSync — Precision Sync")
-        self.geometry("1150x800")
-        self.minsize(850, 650)
-        self.configure(bg=PALETTE["bg"])
-
-        self._entries: list = []
-        self._cancel_event = threading.Event()
-        self._worker = None
-        self._dest_rows: list = []   # list of {frame, var, label_widget}
-
-        self._build_ui()
-        self._load_settings()
-
-    # ── UI construction ──────────────────────────────────────────────
-
-    def _style(self):
-        s = ttk.Style(self)
-        s.theme_use("clam")
-        s.configure("Treeview",
-                     background=PALETTE["surface"],
-                     foreground=PALETTE["text"],
-                     fieldbackground=PALETTE["surface"],
-                     rowheight=22,
-                     font=("Consolas", 9))
-        s.configure("Treeview.Heading",
-                     background=PALETTE["mantle"],
-                     foreground=PALETTE["subtext"],
-                     font=("Segoe UI", 9, "bold"))
-        s.map("Treeview",
-              background=[("selected", PALETTE["border"])],
-              foreground=[("selected", PALETTE["text"])])
-        s.configure("Horizontal.TScrollbar",
-                     background=PALETTE["surface"],
-                     troughcolor=PALETTE["mantle"])
-        s.configure("Vertical.TScrollbar",
-                     background=PALETTE["surface"],
-                     troughcolor=PALETTE["mantle"])
-        s.configure("TProgressbar",
-                     troughcolor=PALETTE["mantle"],
-                     background=PALETTE["accent"])
-
-    def _build_ui(self):
-        self._style()
-
-        top = tk.Frame(self, bg=PALETTE["bg"], padx=12, pady=8)
-        top.pack(fill="x")
-
-        # Source row
-        self._build_folder_row(top, "Source (Place A):", "src")
-
-        # ── Destination section ──────────────────────────────────────
-        self._dest_section = tk.Frame(top, bg=PALETTE["bg"])
-        self._dest_section.pack(fill="x")
-
-        # Always add the first (default) destination
-        self._add_dest_row()
-
-        # Plus button row
-        plus_row = tk.Frame(top, bg=PALETTE["bg"])
-        plus_row.pack(fill="x", pady=(2, 0))
-        tk.Label(plus_row, text="", width=19, bg=PALETTE["bg"]).pack(side="left")
-        self._btn(plus_row, "+ Add Destination", self._add_dest_row,
-                  PALETTE["border"]).pack(side="left", pady=2)
-
-        # Options row
-        self._build_options_row(top)
-
-        # ── Action bar ───────────────────────────────────────────────
-        bar = tk.Frame(self, bg=PALETTE["surface"], pady=6)
-        bar.pack(fill="x", padx=12)
-        self._btn_scan   = self._btn(bar, "Scan / Compare", self._on_scan,   PALETTE["accent"])
-        self._btn_sync   = self._btn(bar, "Sync →",         self._on_sync,   PALETTE["green"],  state="disabled")
-        self._btn_cancel = self._btn(bar, "Cancel",         self._on_cancel, PALETTE["red"],    state="disabled")
-        for b in (self._btn_scan, self._btn_sync, self._btn_cancel):
-            b.pack(side="left", padx=6, pady=4)
-
-        # ── Progress ─────────────────────────────────────────────────
-        prog_frame = tk.Frame(self, bg=PALETTE["bg"], padx=12, pady=2)
-        prog_frame.pack(fill="x")
-        self._progress_var = tk.DoubleVar()
-        self._progress = ttk.Progressbar(prog_frame, variable=self._progress_var,
-                                          maximum=100, mode="determinate")
-        self._progress.pack(fill="x")
-        self._progress_label = tk.Label(prog_frame, text="", bg=PALETTE["bg"],
-                                         fg=PALETTE["subtext"], font=("Segoe UI", 9))
-        self._progress_label.pack(anchor="w")
-
-        # ── File list ────────────────────────────────────────────────
-        list_frame = tk.Frame(self, bg=PALETTE["bg"], padx=12, pady=4)
-        list_frame.pack(fill="both", expand=True)
-
-        # Filter bar
-        filter_bar = tk.Frame(list_frame, bg=PALETTE["bg"])
-        filter_bar.pack(fill="x", pady=(0, 4))
-        tk.Label(filter_bar, text="Filter:", bg=PALETTE["bg"],
-                 fg=PALETTE["subtext"], font=("Segoe UI", 9)).pack(side="left")
-        self._filter_var = tk.StringVar()
-        self._filter_var.trace_add("write", lambda *_: self._apply_filter())
-        tk.Entry(filter_bar, textvariable=self._filter_var,
-                 bg=PALETTE["surface"], fg=PALETTE["text"],
-                 insertbackground=PALETTE["text"], relief="flat",
-                 font=("Segoe UI", 9), width=30).pack(side="left", padx=4)
-
-        self._show_new       = tk.BooleanVar(value=True)
-        self._show_modified  = tk.BooleanVar(value=True)
-        self._show_unchanged = tk.BooleanVar(value=False)
-        self._show_destonly  = tk.BooleanVar(value=True)
-        for text, var in [
-            ("New",       self._show_new),
-            ("Modified",  self._show_modified),
-            ("Unchanged", self._show_unchanged),
-            ("Dest Only", self._show_destonly),
-        ]:
-            tk.Checkbutton(filter_bar, text=text, variable=var,
-                           bg=PALETTE["bg"], fg=PALETTE["text"],
-                           selectcolor=PALETTE["surface"],
-                           activebackground=PALETTE["bg"],
-                           command=self._apply_filter,
-                           font=("Segoe UI", 9)).pack(side="left", padx=4)
-
-        self._stats_label = tk.Label(filter_bar, text="", bg=PALETTE["bg"],
-                                      fg=PALETTE["subtext"], font=("Segoe UI", 9))
-        self._stats_label.pack(side="right", padx=4)
-
-        # Treeview
-        cols = ("status", "path", "src_size", "dst_size", "sync_to", "note")
-        self._tree = ttk.Treeview(list_frame, columns=cols, show="headings",
-                                   selectmode="extended")
-        self._tree.heading("status",   text="Status",        anchor="w")
-        self._tree.heading("path",     text="Relative Path", anchor="w")
-        self._tree.heading("src_size", text="Src Size",      anchor="e")
-        self._tree.heading("dst_size", text="Dst Size",      anchor="e")
-        self._tree.heading("sync_to",  text="Sync To",       anchor="w")
-        self._tree.heading("note",     text="Note",          anchor="w")
-        self._tree.column("status",   width=90,  stretch=False)
-        self._tree.column("path",     width=500, stretch=True)
-        self._tree.column("src_size", width=90,  stretch=False, anchor="e")
-        self._tree.column("dst_size", width=90,  stretch=False, anchor="e")
-        self._tree.column("sync_to",  width=100, stretch=False)
-        self._tree.column("note",     width=150, stretch=False)
-
-        vsb = ttk.Scrollbar(list_frame, orient="vertical", command=self._tree.yview)
-        self._tree.configure(yscrollcommand=vsb.set)
-        self._tree.pack(side="left", fill="both", expand=True)
-        vsb.pack(side="right", fill="y")
-
-        # ── Log ──────────────────────────────────────────────────────
-        log_frame = tk.Frame(self, bg=PALETTE["bg"], padx=12, pady=4)
-        log_frame.pack(fill="x")
-        tk.Label(log_frame, text="Log", bg=PALETTE["bg"],
-                 fg=PALETTE["subtext"], font=("Segoe UI", 8)).pack(anchor="w")
-        self._log_text = tk.Text(log_frame, height=6, bg=PALETTE["mantle"],
-                                  fg=PALETTE["text"], font=("Consolas", 8),
-                                  relief="flat", state="disabled", wrap="none")
-        log_scroll = ttk.Scrollbar(log_frame, orient="vertical",
-                                    command=self._log_text.yview)
-        self._log_text.configure(yscrollcommand=log_scroll.set)
-        self._log_text.pack(side="left", fill="x", expand=True)
-        log_scroll.pack(side="right", fill="y")
-
-    def _build_folder_row(self, parent, label_text: str, key: str):
-        row = tk.Frame(parent, bg=PALETTE["bg"])
-        row.pack(fill="x", pady=2)
-        tk.Label(row, text=label_text, bg=PALETTE["bg"], fg=PALETTE["text"],
-                 font=("Segoe UI", 9), width=19, anchor="e").pack(side="left")
-        var = tk.StringVar()
-        setattr(self, f"_{key}_var", var)
-        tk.Entry(row, textvariable=var, bg=PALETTE["surface"],
-                 fg=PALETTE["text"], insertbackground=PALETTE["text"],
-                 relief="flat", font=("Segoe UI", 9)).pack(
-            side="left", fill="x", expand=True, padx=4)
-        self._btn(row, "Browse…",
-                  lambda k=key: self._browse(k), PALETTE["border"]).pack(side="left")
-
-    def _btn(self, parent, text, command, color=None, state="normal"):
-        color = color or PALETTE["border"]
-        return tk.Button(
-            parent, text=text, command=command,
-            bg=color, fg=PALETTE["bg"],
-            activebackground=PALETTE["accent"],
-            font=("Segoe UI", 9, "bold"),
-            relief="flat", padx=10, pady=4,
-            state=state,
-        )
-
-    def _build_options_row(self, parent):
-        row = tk.Frame(parent, bg=PALETTE["bg"])
-        row.pack(fill="x", pady=4)
-        tk.Label(row, text="Excludes:", bg=PALETTE["bg"], fg=PALETTE["text"],
-                 font=("Segoe UI", 9), width=19, anchor="e").pack(side="left")
-        self._excludes_var = tk.StringVar(value=", ".join(UE_DEFAULT_EXCLUDES))
-        tk.Entry(row, textvariable=self._excludes_var,
-                 bg=PALETTE["surface"], fg=PALETTE["text"],
-                 insertbackground=PALETTE["text"],
-                 relief="flat", font=("Segoe UI", 9)).pack(
-            side="left", fill="x", expand=True, padx=4)
-        self._use_hash_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(row, text="Precise (hash content)",
-                       variable=self._use_hash_var,
-                       bg=PALETTE["bg"], fg=PALETTE["text"],
-                       selectcolor=PALETTE["surface"],
-                       activebackground=PALETTE["bg"],
-                       font=("Segoe UI", 9)).pack(side="left", padx=8)
-        self._del_destonly_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(row, text="Delete dest-only files",
-                       variable=self._del_destonly_var,
-                       bg=PALETTE["bg"], fg=PALETTE["red"],
-                       selectcolor=PALETTE["surface"],
-                       activebackground=PALETTE["bg"],
-                       font=("Segoe UI", 9)).pack(side="left", padx=4)
-
-    # ── Destination rows ─────────────────────────────────────────────
-
-    def _add_dest_row(self, path: str = ""):
-        idx = len(self._dest_rows)
-        is_default = (idx == 0)
-
-        row_frame = tk.Frame(self._dest_section, bg=PALETTE["bg"])
-        row_frame.pack(fill="x", pady=1)
-
-        label_text = "Destination (Place B):" if is_default else f"Destination {idx + 1}:"
-        lbl = tk.Label(row_frame, text=label_text, bg=PALETTE["bg"], fg=PALETTE["text"],
-                       font=("Segoe UI", 9), width=19, anchor="e")
-        lbl.pack(side="left")
-
-        var = tk.StringVar(value=path)
-        tk.Entry(row_frame, textvariable=var, bg=PALETTE["surface"],
-                 fg=PALETTE["text"], insertbackground=PALETTE["text"],
-                 relief="flat", font=("Segoe UI", 9)).pack(
-            side="left", fill="x", expand=True, padx=4)
-
-        row_data = {"frame": row_frame, "var": var, "label": lbl}
-
-        self._btn(row_frame, "Browse…",
-                  lambda rd=row_data: self._browse_dest(rd),
-                  PALETTE["border"]).pack(side="left")
-
-        if not is_default:
-            self._btn(row_frame, "−",
-                      lambda rd=row_data: self._remove_dest_row(rd),
-                      PALETTE["red"]).pack(side="left", padx=(4, 0))
-
-        self._dest_rows.append(row_data)
-        self._save_settings()
-
-    def _remove_dest_row(self, row_data: dict):
-        row_data["frame"].destroy()
-        self._dest_rows.remove(row_data)
-        self._renumber_dest_labels()
-        self._save_settings()
-
-    def _renumber_dest_labels(self):
-        for i, row in enumerate(self._dest_rows):
-            text = "Destination (Place B):" if i == 0 else f"Destination {i + 1}:"
-            row["label"].config(text=text)
-
-    def _dest_paths(self) -> list:
-        """Return list of non-empty destination Path objects."""
-        paths = []
-        for row in self._dest_rows:
-            p = row["var"].get().strip()
-            if p:
-                paths.append(Path(p))
-        return paths
-
-    # ── Browse ────────────────────────────────────────────────────────
-
-    def _browse(self, key: str):
-        folder = filedialog.askdirectory(
-            title=f"Select {'Source' if key == 'src' else 'Destination'} Folder")
-        if folder:
-            getattr(self, f"_{key}_var").set(folder)
-            self._save_settings()
-
-    def _browse_dest(self, row_data: dict):
-        folder = filedialog.askdirectory(title="Select Destination Folder")
-        if folder:
-            row_data["var"].set(folder)
-            self._save_settings()
-
-    # ── Scan ─────────────────────────────────────────────────────────
-
-    def _on_scan(self):
-        src = self._src_var.get().strip()
-        if not src:
-            messagebox.showwarning("Missing source", "Please select a source folder.")
-            return
-        if not Path(src).is_dir():
-            messagebox.showerror("Invalid source", f"Source folder not found:\n{src}")
-            return
-
-        dst_paths = self._dest_paths()
-        if not dst_paths:
-            messagebox.showwarning("No destinations", "Add at least one destination folder.")
-            return
-
-        # Ensure all destinations exist (offer to create)
-        for dp in dst_paths:
-            if not dp.exists():
-                if messagebox.askyesno("Create destination?",
-                                        f"Destination does not exist:\n{dp}\n\nCreate it?"):
-                    dp.mkdir(parents=True)
-                else:
-                    return
-
-        excludes = [x.strip().lower() for x in self._excludes_var.get().split(",") if x.strip()]
-        use_hash = self._use_hash_var.get()
-
-        self._cancel_event.clear()
-        self._set_busy(True)
-        self._clear_tree()
-        self._log(f"── Scan started {datetime.now():%Y-%m-%d %H:%M:%S} ──")
-        self._log(f"   Source : {src}")
-        for i, dp in enumerate(dst_paths):
-            self._log(f"   D{i+1}     : {dp}")
-        self._log(f"   Mode   : {'Precise (hash)' if use_hash else 'Fast (size+mtime)'}")
-
-        def run():
-            results = diff_trees_multi(
-                Path(src), dst_paths, excludes, use_hash,
-                progress_cb=self._update_progress,
-                cancel_event=self._cancel_event,
-            )
-            self.after(0, self._scan_done, results)
-
-        self._worker = threading.Thread(target=run, daemon=True)
-        self._worker.start()
-
-    def _scan_done(self, results: list):
-        self._entries = results
-        self._apply_filter()
-        self._set_busy(False)
-
-        new       = sum(1 for e in results if e.overall_status == FileStatus.NEW)
-        modified  = sum(1 for e in results if e.overall_status == FileStatus.MODIFIED)
-        unchanged = sum(1 for e in results if e.overall_status == FileStatus.UNCHANGED)
-        dest_only = sum(1 for e in results if e.overall_status == FileStatus.DEST_ONLY)
-
-        self._log(f"   New:{new}  Modified:{modified}  Unchanged:{unchanged}  Dest-only:{dest_only}")
-        self._log("── Scan complete ──")
-
-        needs_sync = new + modified + (dest_only if self._del_destonly_var.get() else 0)
-        self._btn_sync.config(state="normal" if needs_sync > 0 else "disabled")
-        self._save_settings()
-
-    # ── Sync ─────────────────────────────────────────────────────────
-
-    def _on_sync(self):
-        to_sync = [e for e in self._entries if e.needs_sync]
-        if not to_sync:
-            messagebox.showinfo("Nothing to sync", "All destinations are up to date.")
-            return
-
-        dst_paths = self._dest_paths()
-        if not dst_paths:
-            messagebox.showwarning("No destinations", "No destination folders configured.")
-            return
-
-        # Build summary for confirmation dialog
-        del_count = sum(
-            1 for e in to_sync
-            if e.overall_status == FileStatus.DEST_ONLY and self._del_destonly_var.get()
-        )
-        dest_labels = [f"D{i+1}: {p}" for i, p in enumerate(dst_paths)]
-        msg = (
-            f"About to sync {len(to_sync)} file(s) to "
-            f"{len(dst_paths)} destination(s):\n\n"
-            + "\n".join(dest_labels)
-        )
-        if del_count:
-            msg += f"\n\n⚠ {del_count} file(s) will be DELETED from destination(s)."
-        msg += "\n\nEach file is only copied to destinations that need it."
-        if not messagebox.askyesno("Confirm Sync", msg):
-            return
-
-        self._cancel_event.clear()
-        self._set_busy(True)
-        self._log(f"── Sync started {datetime.now():%Y-%m-%d %H:%M:%S} ──")
-
-        def run():
-            stats = sync_files_multi(
-                self._entries,
-                dst_roots=dst_paths,
-                copy_new=True,
-                copy_modified=True,
-                delete_dest_only=self._del_destonly_var.get(),
-                progress_cb=self._update_progress,
-                cancel_event=self._cancel_event,
-                log_cb=lambda msg: self.after(0, self._log, msg),
-            )
-            self.after(0, self._sync_done, stats, dst_paths)
-
-        self._worker = threading.Thread(target=run, daemon=True)
-        self._worker.start()
-
-    def _sync_done(self, stats: dict, dst_paths: list):
-        self._set_busy(False)
-
-        total_copied  = sum(s["copied"]  for s in stats.values())
-        total_deleted = sum(s["deleted"] for s in stats.values())
-        total_errors  = sum(s["errors"]  for s in stats.values())
-
-        lines = [f"── Sync complete ──"]
-        for i in range(len(dst_paths)):
-            s = stats[i]
-            lines.append(
-                f"   D{i+1}: copied={s['copied']}  deleted={s['deleted']}  errors={s['errors']}"
-            )
-        for line in lines:
-            self._log(line)
-
-        if total_errors:
-            messagebox.showwarning(
-                "Sync finished with errors",
-                f"Sync completed with errors.\n\n"
-                f"Total copied : {total_copied}\n"
-                f"Total deleted: {total_deleted}\n"
-                f"Total errors : {total_errors}\n\n"
-                "Check the log for details."
-            )
-        else:
-            messagebox.showinfo(
-                "Sync complete",
-                f"Sync finished successfully!\n\n"
-                f"Files copied/updated : {total_copied}\n"
-                f"Files deleted        : {total_deleted}"
-            )
-        self._on_scan()
-
-    # ── Cancel ────────────────────────────────────────────────────────
-
-    def _on_cancel(self):
-        self._cancel_event.set()
-
-    # ── Tree helpers ─────────────────────────────────────────────────
-
-    def _clear_tree(self):
-        for item in self._tree.get_children():
-            self._tree.delete(item)
-
-    def _apply_filter(self):
-        self._clear_tree()
-        text_filter = self._filter_var.get().lower()
-        show_map = {
-            FileStatus.NEW:       self._show_new.get(),
-            FileStatus.MODIFIED:  self._show_modified.get(),
-            FileStatus.UNCHANGED: self._show_unchanged.get(),
-            FileStatus.DEST_ONLY: self._show_destonly.get(),
-        }
-        shown = 0
-        for entry in self._entries:
-            status = entry.overall_status
-            if not show_map.get(status, True):
-                continue
-            if text_filter and text_filter not in entry.rel_path.lower():
-                continue
-
-            note = ""
-            if status == FileStatus.MODIFIED:
-                has_hash = any(ds.dst_hash for ds in entry.dest_statuses)
-                note = "hash differs" if (has_hash or entry.src_hash) else "size/mtime differs"
-
-            # Dst size: use first destination that has the file
-            dst_size = 0
-            for ds in entry.dest_statuses:
-                if ds.dst_size > 0:
-                    dst_size = ds.dst_size
-                    break
-
-            tag = status.value.lower().replace(" ", "_")
-            self._tree.insert(
-                "", "end",
-                values=(
-                    status.value,
-                    entry.rel_path,
-                    _fmt_size(entry.src_size),
-                    _fmt_size(dst_size),
-                    entry.dest_label() or "—",
-                    note,
-                ),
-                tags=(tag,),
-            )
-            shown += 1
-
-        for status, color in STATUS_COLOR.items():
-            self._tree.tag_configure(
-                status.value.lower().replace(" ", "_"),
-                foreground=color,
-            )
-
-        counts = {s: sum(1 for e in self._entries if e.overall_status == s)
-                  for s in FileStatus}
-        self._stats_label.config(
-            text=f"New:{counts[FileStatus.NEW]}  "
-                 f"Mod:{counts[FileStatus.MODIFIED]}  "
-                 f"Same:{counts[FileStatus.UNCHANGED]}  "
-                 f"DstOnly:{counts[FileStatus.DEST_ONLY]}  "
-                 f"| Shown:{shown}"
-        )
-
-    # ── Progress ─────────────────────────────────────────────────────
-
-    def _update_progress(self, current: int, total: int, message: str):
-        pct = (current / total * 100) if total > 0 else 0
-        self.after(0, self._progress_var.set, pct)
-        self.after(0, self._progress_label.config, {"text": message})
-
-    # ── Busy state ───────────────────────────────────────────────────
-
-    def _set_busy(self, busy: bool):
-        if busy:
-            self._btn_scan.config(state="disabled")
-            self._btn_sync.config(state="disabled")
-            self._btn_cancel.config(state="normal")
-        else:
-            self._btn_scan.config(state="normal")
-            self._btn_cancel.config(state="disabled")
-
-    # ── Log ──────────────────────────────────────────────────────────
-
-    def _log(self, message: str):
-        self._log_text.config(state="normal")
-        self._log_text.insert("end", message + "\n")
-        self._log_text.see("end")
-        self._log_text.config(state="disabled")
-
-    # ── Settings persistence ─────────────────────────────────────────
-
-    def _settings_path(self) -> Path:
-        return Path.home() / ".filesync_settings.json"
-
-    def _save_settings(self):
-        # Guard against being called before all widgets are constructed
-        if not hasattr(self, "_excludes_var"):
-            return
-        data = {
-            "src": self._src_var.get(),
-            "destinations": [row["var"].get() for row in self._dest_rows],
-            "excludes": self._excludes_var.get(),
-            "use_hash": self._use_hash_var.get(),
-            "del_destonly": self._del_destonly_var.get(),
-        }
-        try:
-            self._settings_path().write_text(json.dumps(data, indent=2))
-        except Exception:
-            pass
-
-    def _load_settings(self):
-        try:
-            data = json.loads(self._settings_path().read_text())
-            self._src_var.set(data.get("src", ""))
-            self._excludes_var.set(data.get("excludes", ", ".join(UE_DEFAULT_EXCLUDES)))
-            self._use_hash_var.set(data.get("use_hash", True))
-            self._del_destonly_var.set(data.get("del_destonly", False))
-
-            destinations = data.get("destinations", [""])
-            # First destination is already created by _add_dest_row() in __init__
-            if destinations:
-                self._dest_rows[0]["var"].set(destinations[0])
-            for path in destinations[1:]:
-                self._add_dest_row(path=path)
-        except Exception:
-            pass
 
 
 # ─────────────────────────────────────────────
@@ -900,9 +377,740 @@ def _fmt_size(n: int) -> str:
 
 
 # ─────────────────────────────────────────────
+# GUI — Kivy
+# ─────────────────────────────────────────────
+
+UE_DEFAULT_EXCLUDES = [
+    "intermediate", "saved", "deriveddatacache",
+    "binaries", ".vs", ".git", "__pycache__",
+]
+
+PALETTE = {
+    "bg":      (0.118, 0.118, 0.180, 1),
+    "surface": (0.165, 0.165, 0.243, 1),
+    "border":  (0.227, 0.227, 0.353, 1),
+    "accent":  (0.486, 0.620, 0.973, 1),
+    "text":    (0.804, 0.839, 0.957, 1),
+    "subtext": (0.651, 0.678, 0.784, 1),
+    "green":   (0.651, 0.890, 0.631, 1),
+    "yellow":  (0.976, 0.886, 0.686, 1),
+    "red":     (0.953, 0.545, 0.659, 1),
+    "blue":    (0.537, 0.706, 0.980, 1),
+    "mantle":  (0.094, 0.094, 0.145, 1),
+    "orange":  (0.980, 0.702, 0.529, 1),
+}
+
+def C(key):
+    return PALETTE[key]
+
+STATUS_COLORS = {
+    FileStatus.NEW:       C("green"),
+    FileStatus.MODIFIED:  C("yellow"),
+    FileStatus.UNCHANGED: C("subtext"),
+    FileStatus.DEST_ONLY: C("red"),
+}
+
+KV = """
+<FileRow>:
+    orientation: 'horizontal'
+    size_hint_y: None
+    height: dp(26)
+    spacing: dp(1)
+    canvas.before:
+        Color:
+            rgba: (0.165, 0.165, 0.243, 1)
+        Rectangle:
+            pos: self.pos
+            size: self.size
+    Label:
+        text: root.status_text
+        size_hint_x: None
+        width: dp(90)
+        color: root.status_color
+        font_size: sp(9)
+        halign: 'left'
+        valign: 'middle'
+        text_size: self.size
+        padding: [dp(4), 0]
+    Label:
+        text: root.path_text
+        size_hint_x: 1
+        color: (0.804, 0.839, 0.957, 1)
+        font_size: sp(9)
+        halign: 'left'
+        valign: 'middle'
+        text_size: self.size
+        padding: [dp(4), 0]
+    Label:
+        text: root.src_size_text
+        size_hint_x: None
+        width: dp(80)
+        color: (0.804, 0.839, 0.957, 1)
+        font_size: sp(9)
+        halign: 'right'
+        valign: 'middle'
+        text_size: self.size
+        padding: [dp(4), 0]
+    Label:
+        text: root.dst_size_text
+        size_hint_x: None
+        width: dp(80)
+        color: (0.804, 0.839, 0.957, 1)
+        font_size: sp(9)
+        halign: 'right'
+        valign: 'middle'
+        text_size: self.size
+        padding: [dp(4), 0]
+    Label:
+        text: root.sync_to_text
+        size_hint_x: None
+        width: dp(90)
+        color: (0.804, 0.839, 0.957, 1)
+        font_size: sp(9)
+        halign: 'left'
+        valign: 'middle'
+        text_size: self.size
+        padding: [dp(4), 0]
+    Label:
+        text: root.note_text
+        size_hint_x: None
+        width: dp(140)
+        color: (0.651, 0.678, 0.784, 1)
+        font_size: sp(9)
+        halign: 'left'
+        valign: 'middle'
+        text_size: self.size
+        padding: [dp(4), 0]
+"""
+Builder.load_string(KV)
+
+
+class FileRow(RecycleDataViewBehavior, BoxLayout):
+    status_text   = StringProperty('')
+    path_text     = StringProperty('')
+    src_size_text = StringProperty('')
+    dst_size_text = StringProperty('')
+    sync_to_text  = StringProperty('')
+    note_text     = StringProperty('')
+    status_color  = ListProperty([1, 1, 1, 1])
+
+    def refresh_view_attrs(self, rv, index, data):
+        self.status_text   = data.get('status_text', '')
+        self.path_text     = data.get('path_text', '')
+        self.src_size_text = data.get('src_size_text', '')
+        self.dst_size_text = data.get('dst_size_text', '')
+        self.sync_to_text  = data.get('sync_to_text', '')
+        self.note_text     = data.get('note_text', '')
+        self.status_color  = data.get('status_color', [1, 1, 1, 1])
+        return super().refresh_view_attrs(rv, index, data)
+
+
+def _set_bg(widget, color_key):
+    with widget.canvas.before:
+        Color(*C(color_key))
+        rect = Rectangle(pos=widget.pos, size=widget.size)
+    widget.bind(
+        pos=lambda *_: setattr(rect, 'pos', widget.pos),
+        size=lambda *_: setattr(rect, 'size', widget.size),
+    )
+
+
+class FileSyncApp(App):
+
+    def build(self):
+        self.title = 'FileSync — Precision Sync'
+        Window.size = (1150, 800)
+        Window.clearcolor = C('bg')
+        Window.bind(on_resize=self._enforce_min_size)
+
+        self._entries      = []
+        self._cancel_event = threading.Event()
+        self._worker       = None
+        self._dest_rows    = []   # list of {'input': TextInput, 'widget': BoxLayout, 'label': Label}
+
+        root = BoxLayout(orientation='vertical', padding=[dp(8), dp(6)], spacing=dp(4))
+        _set_bg(root, 'bg')
+
+        # ── Config panel ─────────────────────────────────────────────
+        config = BoxLayout(orientation='vertical', size_hint_y=None, spacing=dp(2))
+        config.bind(minimum_height=config.setter('height'))
+
+        config.add_widget(self._make_folder_row('Source (Place A):', is_source=True))
+
+        self._dest_container = BoxLayout(orientation='vertical', size_hint_y=None, spacing=dp(2))
+        self._dest_container.bind(minimum_height=self._dest_container.setter('height'))
+        config.add_widget(self._dest_container)
+
+        add_row = BoxLayout(size_hint_y=None, height=dp(34))
+        add_row.add_widget(Label(size_hint_x=None, width=dp(164)))
+        add_row.add_widget(self._btn('+ Add Destination', self._add_dest_row, 'border',
+                                     size_hint_x=None, width=dp(140)))
+        add_row.add_widget(Label())
+        config.add_widget(add_row)
+        config.add_widget(self._make_options_row())
+        root.add_widget(config)
+
+        # ── Action bar ───────────────────────────────────────────────
+        bar = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(8),
+                        padding=[dp(8), dp(6)])
+        _set_bg(bar, 'surface')
+        self._btn_scan   = self._btn('Scan / Compare', self._on_scan,   'accent',
+                                     size_hint_x=None, width=dp(140))
+        self._btn_sync   = self._btn('Sync →',         self._on_sync,   'green',
+                                     size_hint_x=None, width=dp(100))
+        self._btn_cancel = self._btn('Cancel',         self._on_cancel, 'red',
+                                     size_hint_x=None, width=dp(90))
+        self._btn_sync.disabled   = True
+        self._btn_cancel.disabled = True
+        bar.add_widget(self._btn_scan)
+        bar.add_widget(self._btn_sync)
+        bar.add_widget(self._btn_cancel)
+        bar.add_widget(Label())
+        root.add_widget(bar)
+
+        # ── Progress ─────────────────────────────────────────────────
+        prog = BoxLayout(orientation='vertical', size_hint_y=None, height=dp(40), spacing=dp(2))
+        self._progress_bar = ProgressBar(max=100, value=0, size_hint_y=None, height=dp(14))
+        self._progress_lbl = Label(text='', color=C('subtext'), font_size=sp(9),
+                                   halign='left', size_hint_y=None, height=dp(16))
+        self._progress_lbl.bind(size=self._progress_lbl.setter('text_size'))
+        prog.add_widget(self._progress_bar)
+        prog.add_widget(self._progress_lbl)
+        root.add_widget(prog)
+
+        # ── Filter bar ───────────────────────────────────────────────
+        root.add_widget(self._make_filter_bar())
+
+        # ── Column headers ───────────────────────────────────────────
+        root.add_widget(self._make_col_headers())
+
+        # ── File list (RecycleView) ───────────────────────────────────
+        rv = RecycleView(size_hint_y=1)
+        rv.viewclass = 'FileRow'
+        rl = RecycleBoxLayout(
+            default_size=(None, dp(26)),
+            default_size_hint=(1, None),
+            size_hint_y=None,
+            orientation='vertical',
+            spacing=dp(1),
+        )
+        rl.bind(minimum_height=rl.setter('height'))
+        rv.add_widget(rl)
+        _set_bg(rv, 'surface')
+        self._file_rv = rv
+        root.add_widget(rv)
+
+        # ── Log ──────────────────────────────────────────────────────
+        self._log_input = TextInput(
+            text='',
+            readonly=True,
+            multiline=True,
+            background_color=C('mantle'),
+            foreground_color=C('text'),
+            font_name='RobotoMono-Regular',
+            font_size=sp(8),
+            size_hint_y=None,
+            height=dp(110),
+        )
+        root.add_widget(self._log_input)
+
+        self._add_dest_row()
+        self._load_settings()
+        return root
+
+    def _enforce_min_size(self, win, w, h):
+        if w < 850:
+            win.width = 850
+        if h < 650:
+            win.height = 650
+
+    # ── Widget helpers ────────────────────────────────────────────────
+
+    def _btn(self, text, callback, color_key='border', **kwargs):
+        b = Button(
+            text=text,
+            background_normal='',
+            background_color=C(color_key),
+            color=C('bg'),
+            bold=True,
+            font_size=sp(10),
+            size_hint_y=None,
+            height=dp(32),
+            **kwargs,
+        )
+        b.bind(on_release=lambda *_: callback())
+        return b
+
+    def _make_folder_row(self, label_text: str, is_source: bool = False):
+        row = BoxLayout(size_hint_y=None, height=dp(34), spacing=dp(4))
+        row.add_widget(Label(
+            text=label_text, color=C('text'), font_size=sp(10),
+            size_hint_x=None, width=dp(160),
+            halign='right', valign='middle', text_size=(dp(155), dp(34)),
+        ))
+        inp = TextInput(
+            background_color=C('surface'), foreground_color=C('text'),
+            cursor_color=C('text'), multiline=False, font_size=sp(10),
+            padding=[dp(6), dp(6)],
+        )
+        row.add_widget(inp)
+        if is_source:
+            self._src_input = inp
+        row.add_widget(self._btn('Browse…', lambda i=inp: self._browse_folder(i), 'border',
+                                 size_hint_x=None, width=dp(80)))
+        return row
+
+    def _add_dest_row(self, path: str = ''):
+        idx        = len(self._dest_rows)
+        is_default = idx == 0
+
+        row = BoxLayout(size_hint_y=None, height=dp(34), spacing=dp(4))
+        lbl_text = 'Destination (Place B):' if is_default else f'Destination {idx + 1}:'
+        lbl = Label(
+            text=lbl_text, color=C('text'), font_size=sp(10),
+            size_hint_x=None, width=dp(160),
+            halign='right', valign='middle', text_size=(dp(155), dp(34)),
+        )
+        row.add_widget(lbl)
+
+        inp = TextInput(
+            text=path, background_color=C('surface'), foreground_color=C('text'),
+            cursor_color=C('text'), multiline=False, font_size=sp(10),
+            padding=[dp(6), dp(6)],
+        )
+        row.add_widget(inp)
+        row.add_widget(self._btn('Browse…', lambda i=inp: self._browse_folder(i), 'border',
+                                 size_hint_x=None, width=dp(80)))
+
+        row_data = {'input': inp, 'widget': row, 'label': lbl}
+
+        if not is_default:
+            def _remove(rd=row_data):
+                self._dest_container.remove_widget(rd['widget'])
+                self._dest_rows.remove(rd)
+                self._renumber_dest_labels()
+                self._save_settings()
+            row.add_widget(self._btn('−', _remove, 'red', size_hint_x=None, width=dp(30)))
+
+        self._dest_rows.append(row_data)
+        self._dest_container.add_widget(row)
+        self._save_settings()
+
+    def _renumber_dest_labels(self):
+        for i, rd in enumerate(self._dest_rows):
+            rd['label'].text = 'Destination (Place B):' if i == 0 else f'Destination {i + 1}:'
+
+    def _make_options_row(self):
+        row = BoxLayout(size_hint_y=None, height=dp(34), spacing=dp(8))
+        row.add_widget(Label(
+            text='Excludes:', color=C('text'), font_size=sp(10),
+            size_hint_x=None, width=dp(160),
+            halign='right', valign='middle', text_size=(dp(155), dp(34)),
+        ))
+        self._excludes_input = TextInput(
+            text=', '.join(UE_DEFAULT_EXCLUDES),
+            background_color=C('surface'), foreground_color=C('text'),
+            cursor_color=C('text'), multiline=False, font_size=sp(10),
+            padding=[dp(6), dp(6)],
+        )
+        row.add_widget(self._excludes_input)
+
+        self._use_hash_cb = CheckBox(active=True, size_hint_x=None, width=dp(22),
+                                     color=C('accent'))
+        row.add_widget(self._use_hash_cb)
+        row.add_widget(Label(text='Precise (hash)', color=C('text'), font_size=sp(10),
+                              size_hint_x=None, width=dp(110)))
+
+        self._del_destonly_cb = CheckBox(active=False, size_hint_x=None, width=dp(22),
+                                          color=C('red'))
+        row.add_widget(self._del_destonly_cb)
+        row.add_widget(Label(text='Delete dest-only', color=C('red'), font_size=sp(10),
+                              size_hint_x=None, width=dp(120)))
+        return row
+
+    def _make_filter_bar(self):
+        bar = BoxLayout(size_hint_y=None, height=dp(32), spacing=dp(6))
+        bar.add_widget(Label(text='Filter:', color=C('subtext'), font_size=sp(10),
+                              size_hint_x=None, width=dp(42)))
+        self._filter_input = TextInput(
+            background_color=C('surface'), foreground_color=C('text'),
+            cursor_color=C('text'), multiline=False, font_size=sp(10),
+            size_hint_x=None, width=dp(200), padding=[dp(6), dp(4)],
+        )
+        self._filter_input.bind(text=lambda *_: self._apply_filter())
+        bar.add_widget(self._filter_input)
+
+        self._filter_new_cb       = CheckBox(active=True,  size_hint_x=None, width=dp(20), color=C('green'))
+        self._filter_modified_cb  = CheckBox(active=True,  size_hint_x=None, width=dp(20), color=C('yellow'))
+        self._filter_unchanged_cb = CheckBox(active=False, size_hint_x=None, width=dp(20), color=C('subtext'))
+        self._filter_destonly_cb  = CheckBox(active=True,  size_hint_x=None, width=dp(20), color=C('red'))
+
+        for cb, text, w in [
+            (self._filter_new_cb,       'New',       dp(38)),
+            (self._filter_modified_cb,  'Modified',  dp(68)),
+            (self._filter_unchanged_cb, 'Unchanged', dp(80)),
+            (self._filter_destonly_cb,  'Dest Only', dp(72)),
+        ]:
+            cb.bind(active=lambda *_: self._apply_filter())
+            bar.add_widget(cb)
+            bar.add_widget(Label(text=text, color=C('text'), font_size=sp(10),
+                                  size_hint_x=None, width=w))
+
+        self._stats_lbl = Label(text='', color=C('subtext'), font_size=sp(9), halign='right')
+        self._stats_lbl.bind(size=self._stats_lbl.setter('text_size'))
+        bar.add_widget(self._stats_lbl)
+        return bar
+
+    def _make_col_headers(self):
+        hdr = BoxLayout(size_hint_y=None, height=dp(24), spacing=dp(1), padding=[0, 0])
+        _set_bg(hdr, 'mantle')
+        for text, fixed_w in [
+            ('Status',        dp(90)),
+            ('Relative Path', None),
+            ('Src Size',      dp(80)),
+            ('Dst Size',      dp(80)),
+            ('Sync To',       dp(90)),
+            ('Note',          dp(140)),
+        ]:
+            kw = {'size_hint_x': None, 'width': fixed_w} if fixed_w else {'size_hint_x': 1}
+            lbl = Label(text=text, color=C('subtext'), font_size=sp(9), bold=True,
+                        halign='left', valign='middle', padding=[dp(4), 0], **kw)
+            lbl.bind(size=lbl.setter('text_size'))
+            hdr.add_widget(lbl)
+        return hdr
+
+    # ── Browse folder popup ───────────────────────────────────────────
+
+    def _browse_folder(self, target_input: TextInput):
+        start = target_input.text.strip()
+        if not start or not Path(start).is_dir():
+            start = str(Path.home())
+
+        content = BoxLayout(orientation='vertical', spacing=dp(8), padding=dp(4))
+        fc = FileChooserListView(path=start, dirselect=True)
+        fc.filters = [lambda folder, fname: os.path.isdir(os.path.join(folder, fname))]
+
+        btn_row = BoxLayout(size_hint_y=None, height=dp(38), spacing=dp(8))
+        popup   = Popup(title='Select Folder', content=content, size_hint=(0.85, 0.85))
+
+        def _select(*_):
+            if fc.selection:
+                target_input.text = fc.selection[0]
+            popup.dismiss()
+            self._save_settings()
+
+        ok  = Button(text='Select', background_normal='', background_color=C('accent'), color=C('bg'))
+        can = Button(text='Cancel', background_normal='', background_color=C('border'), color=C('bg'))
+        ok.bind(on_release=_select)
+        can.bind(on_release=lambda *_: popup.dismiss())
+        btn_row.add_widget(ok)
+        btn_row.add_widget(can)
+        content.add_widget(fc)
+        content.add_widget(btn_row)
+        popup.open()
+
+    # ── Dialogs ───────────────────────────────────────────────────────
+
+    def _alert(self, title: str, msg: str, callback=None):
+        content = BoxLayout(orientation='vertical', padding=dp(14), spacing=dp(10))
+        lbl = Label(text=msg, color=C('text'), font_size=sp(10),
+                    halign='center', valign='top', size_hint_y=1)
+        lbl.bind(size=lbl.setter('text_size'))
+        content.add_widget(lbl)
+        popup = Popup(title=title, content=content,
+                      size_hint=(None, None), size=(dp(400), dp(220)))
+        btn = Button(text='OK', background_normal='', background_color=C('accent'),
+                     color=C('bg'), size_hint_y=None, height=dp(36))
+        def _ok(*_):
+            popup.dismiss()
+            if callback:
+                callback()
+        btn.bind(on_release=_ok)
+        content.add_widget(btn)
+        popup.open()
+
+    def _confirm(self, title: str, msg: str, on_yes, on_no=None):
+        content = BoxLayout(orientation='vertical', padding=dp(14), spacing=dp(10))
+        lbl = Label(text=msg, color=C('text'), font_size=sp(10),
+                    halign='left', valign='top', size_hint_y=1)
+        lbl.bind(size=lbl.setter('text_size'))
+        content.add_widget(lbl)
+        btn_row = BoxLayout(size_hint_y=None, height=dp(38), spacing=dp(8))
+        popup   = Popup(title=title, content=content,
+                        size_hint=(None, None), size=(dp(500), dp(320)))
+        yes = Button(text='Yes', background_normal='', background_color=C('green'), color=C('bg'))
+        no  = Button(text='No',  background_normal='', background_color=C('red'),   color=C('bg'))
+        yes.bind(on_release=lambda *_: (popup.dismiss(), on_yes()))
+        no.bind(on_release=lambda *_: (popup.dismiss(), on_no() if on_no else None))
+        btn_row.add_widget(yes)
+        btn_row.add_widget(no)
+        content.add_widget(btn_row)
+        popup.open()
+
+    # ── Scan ─────────────────────────────────────────────────────────
+
+    def _on_scan(self):
+        src = self._src_input.text.strip()
+        if not src:
+            self._alert('Missing source', 'Please select a source folder.')
+            return
+        if not Path(src).is_dir():
+            self._alert('Invalid source', f'Source folder not found:\n{src}')
+            return
+
+        dst_paths = self._dest_paths()
+        if not dst_paths:
+            self._alert('No destinations', 'Add at least one destination folder.')
+            return
+
+        missing = [p for p in dst_paths if not p.exists()]
+        if missing:
+            msg = ('These destinations do not exist:\n'
+                   + '\n'.join(str(p) for p in missing)
+                   + '\n\nCreate them?')
+            def _create_and_scan():
+                for p in missing:
+                    p.mkdir(parents=True)
+                self._do_scan(Path(src), dst_paths)
+            self._confirm('Create destinations?', msg, on_yes=_create_and_scan)
+            return
+
+        self._do_scan(Path(src), dst_paths)
+
+    def _do_scan(self, src: Path, dst_paths: list):
+        excludes = [x.strip().lower() for x in self._excludes_input.text.split(',') if x.strip()]
+        use_hash = self._use_hash_cb.active
+
+        self._cancel_event.clear()
+        self._set_busy(True)
+        self._file_rv.data = []
+        self._log(f'── Scan started {datetime.now():%Y-%m-%d %H:%M:%S} ──')
+        self._log(f'   Source : {src}')
+        for i, dpath in enumerate(dst_paths):
+            self._log(f'   D{i+1}     : {dpath}')
+        self._log(f"   Mode   : {'Precise (hash/' + _HASH_ALGO + ')' if use_hash else 'Fast (size+mtime)'}")
+
+        def run():
+            results = diff_trees_multi(
+                src, dst_paths, excludes, use_hash,
+                progress_cb=self._update_progress,
+                cancel_event=self._cancel_event,
+            )
+            Clock.schedule_once(lambda dt: self._scan_done(results), 0)
+
+        self._worker = threading.Thread(target=run, daemon=True)
+        self._worker.start()
+
+    def _scan_done(self, results: list):
+        self._entries = results
+        self._apply_filter()
+        self._set_busy(False)
+
+        new       = sum(1 for e in results if e.overall_status == FileStatus.NEW)
+        modified  = sum(1 for e in results if e.overall_status == FileStatus.MODIFIED)
+        unchanged = sum(1 for e in results if e.overall_status == FileStatus.UNCHANGED)
+        dest_only = sum(1 for e in results if e.overall_status == FileStatus.DEST_ONLY)
+
+        self._log(f'   New:{new}  Modified:{modified}  Unchanged:{unchanged}  Dest-only:{dest_only}')
+        self._log('── Scan complete ──')
+
+        needs_sync = new + modified + (dest_only if self._del_destonly_cb.active else 0)
+        self._btn_sync.disabled = (needs_sync == 0)
+        self._save_settings()
+
+    # ── Sync ─────────────────────────────────────────────────────────
+
+    def _on_sync(self):
+        to_sync = [e for e in self._entries if e.needs_sync]
+        if not to_sync:
+            self._alert('Nothing to sync', 'All destinations are up to date.')
+            return
+
+        dst_paths = self._dest_paths()
+        if not dst_paths:
+            self._alert('No destinations', 'No destination folders configured.')
+            return
+
+        del_count   = sum(1 for e in to_sync
+                          if e.overall_status == FileStatus.DEST_ONLY
+                          and self._del_destonly_cb.active)
+        dest_lines  = '\n'.join(f'D{i+1}: {p}' for i, p in enumerate(dst_paths))
+        msg = (f'About to sync {len(to_sync)} file(s) to {len(dst_paths)} destination(s):\n\n'
+               f'{dest_lines}')
+        if del_count:
+            msg += f'\n\n⚠ {del_count} file(s) will be DELETED from destination(s).'
+        msg += '\n\nEach file is only copied to destinations that need it.'
+
+        self._confirm('Confirm Sync', msg, on_yes=lambda: self._do_sync(dst_paths))
+
+    def _do_sync(self, dst_paths: list):
+        self._cancel_event.clear()
+        self._set_busy(True)
+        self._log(f'── Sync started {datetime.now():%Y-%m-%d %H:%M:%S} ──')
+
+        def run():
+            stats = sync_files_multi(
+                self._entries,
+                dst_roots=dst_paths,
+                copy_new=True,
+                copy_modified=True,
+                delete_dest_only=self._del_destonly_cb.active,
+                progress_cb=self._update_progress,
+                cancel_event=self._cancel_event,
+                log_cb=lambda m: Clock.schedule_once(lambda dt: self._log(m), 0),
+            )
+            Clock.schedule_once(lambda dt: self._sync_done(stats, dst_paths), 0)
+
+        self._worker = threading.Thread(target=run, daemon=True)
+        self._worker.start()
+
+    def _sync_done(self, stats: dict, dst_paths: list):
+        self._set_busy(False)
+        total_copied  = sum(s['copied']  for s in stats.values())
+        total_deleted = sum(s['deleted'] for s in stats.values())
+        total_errors  = sum(s['errors']  for s in stats.values())
+
+        self._log('── Sync complete ──')
+        for i in range(len(dst_paths)):
+            s = stats[i]
+            self._log(f"   D{i+1}: copied={s['copied']}  deleted={s['deleted']}  errors={s['errors']}")
+
+        if total_errors:
+            self._alert('Sync finished with errors',
+                        f'Errors: {total_errors}\nCopied: {total_copied}\nDeleted: {total_deleted}'
+                        '\n\nCheck the log for details.',
+                        callback=self._on_scan)
+        else:
+            self._alert('Sync complete',
+                        f'Files copied/updated: {total_copied}\nFiles deleted: {total_deleted}',
+                        callback=self._on_scan)
+
+    # ── Cancel ────────────────────────────────────────────────────────
+
+    def _on_cancel(self):
+        self._cancel_event.set()
+
+    # ── Filter / display ──────────────────────────────────────────────
+
+    def _apply_filter(self):
+        text_filter = self._filter_input.text.lower() if hasattr(self, '_filter_input') else ''
+        show_map = {
+            FileStatus.NEW:       self._filter_new_cb.active,
+            FileStatus.MODIFIED:  self._filter_modified_cb.active,
+            FileStatus.UNCHANGED: self._filter_unchanged_cb.active,
+            FileStatus.DEST_ONLY: self._filter_destonly_cb.active,
+        }
+
+        rows = []
+        for entry in self._entries:
+            status = entry.overall_status
+            if not show_map.get(status, True):
+                continue
+            if text_filter and text_filter not in entry.rel_path.lower():
+                continue
+
+            note = ''
+            if status == FileStatus.MODIFIED:
+                has_hash = any(ds.dst_hash for ds in entry.dest_statuses)
+                note = 'hash differs' if (has_hash or entry.src_hash) else 'size/mtime differs'
+
+            dst_size = next((ds.dst_size for ds in entry.dest_statuses if ds.dst_size > 0), 0)
+
+            rows.append({
+                'status_text':   status.value,
+                'path_text':     entry.rel_path,
+                'src_size_text': _fmt_size(entry.src_size),
+                'dst_size_text': _fmt_size(dst_size),
+                'sync_to_text':  entry.dest_label() or '—',
+                'note_text':     note,
+                'status_color':  list(STATUS_COLORS[status]),
+            })
+
+        self._file_rv.data = rows
+
+        counts = {s: sum(1 for e in self._entries if e.overall_status == s) for s in FileStatus}
+        self._stats_lbl.text = (
+            f"New:{counts[FileStatus.NEW]}  "
+            f"Mod:{counts[FileStatus.MODIFIED]}  "
+            f"Same:{counts[FileStatus.UNCHANGED]}  "
+            f"DstOnly:{counts[FileStatus.DEST_ONLY]}  "
+            f"| Shown:{len(rows)}"
+        )
+
+    # ── Progress ─────────────────────────────────────────────────────
+
+    def _update_progress(self, current: int, total: int, message: str):
+        pct = (current / total * 100) if total > 0 else 0
+        def _do(dt):
+            self._progress_bar.value = pct
+            self._progress_lbl.text  = message
+        Clock.schedule_once(_do, 0)
+
+    # ── Busy state ────────────────────────────────────────────────────
+
+    def _set_busy(self, busy: bool):
+        def _do(dt=None):
+            self._btn_scan.disabled   = busy
+            self._btn_sync.disabled   = busy
+            self._btn_cancel.disabled = not busy
+        Clock.schedule_once(_do, 0)
+
+    # ── Log ───────────────────────────────────────────────────────────
+
+    def _log(self, message: str):
+        def _do(dt=None):
+            self._log_input.text += message + '\n'
+        if threading.current_thread() is threading.main_thread():
+            _do()
+        else:
+            Clock.schedule_once(_do, 0)
+
+    # ── Dest paths ────────────────────────────────────────────────────
+
+    def _dest_paths(self) -> list:
+        return [Path(rd['input'].text.strip())
+                for rd in self._dest_rows if rd['input'].text.strip()]
+
+    # ── Settings ─────────────────────────────────────────────────────
+
+    def _settings_path(self) -> Path:
+        return Path.home() / '.filesync_settings.json'
+
+    def _save_settings(self):
+        if not hasattr(self, '_excludes_input'):
+            return
+        data = {
+            'src':          self._src_input.text,
+            'destinations': [rd['input'].text for rd in self._dest_rows],
+            'excludes':     self._excludes_input.text,
+            'use_hash':     self._use_hash_cb.active,
+            'del_destonly': self._del_destonly_cb.active,
+        }
+        try:
+            self._settings_path().write_text(json.dumps(data, indent=2))
+        except Exception:
+            pass
+
+    def _load_settings(self):
+        try:
+            data = json.loads(self._settings_path().read_text())
+            self._src_input.text         = data.get('src', '')
+            self._excludes_input.text    = data.get('excludes', ', '.join(UE_DEFAULT_EXCLUDES))
+            self._use_hash_cb.active     = data.get('use_hash', True)
+            self._del_destonly_cb.active = data.get('del_destonly', False)
+
+            destinations = data.get('destinations', [''])
+            if destinations:
+                self._dest_rows[0]['input'].text = destinations[0]
+            for path in destinations[1:]:
+                self._add_dest_row(path=path)
+        except Exception:
+            pass
+
+
+# ─────────────────────────────────────────────
 # Entry point
 # ─────────────────────────────────────────────
 
-if __name__ == "__main__":
-    app = FileSyncApp()
-    app.mainloop()
+if __name__ == '__main__':
+    FileSyncApp().run()

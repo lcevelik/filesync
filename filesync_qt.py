@@ -103,10 +103,45 @@ def compute_hash(path: Path, chunk_size: int = 1 << 20) -> str:
     return h.hexdigest()
 
 
-def build_file_index(root: Path) -> dict:
-    """Walk a directory → {rel_path: {path, size, mtime}}."""
+def build_file_index(root: Path, exclude_patterns: list = None) -> dict:
+    """Walk a directory → {rel_path: {path, size, mtime}}.
+
+    Args:
+        root: Root directory to index
+        exclude_patterns: List of directory patterns to exclude (e.g., ['Intermediate/', '.git/'])
+    """
     index = {}
+    exclude_patterns = exclude_patterns or []
+
     for dirpath, dirnames, filenames in os.walk(root):
+        # Get relative path of current directory
+        rel_dir = Path(dirpath).relative_to(root)
+        rel_dir_str = str(rel_dir) + "/" if rel_dir != Path(".") else ""
+
+        # Check if current directory should be excluded
+        should_exclude = False
+        for pattern in exclude_patterns:
+            if rel_dir_str.startswith(pattern) or rel_dir_str == pattern.rstrip('/'):
+                should_exclude = True
+                break
+
+        if should_exclude:
+            dirnames.clear()  # Don't recurse into this directory
+            continue
+
+        # Filter out excluded subdirectories
+        dirs_to_remove = []
+        for dirname in dirnames:
+            check_path = rel_dir_str + dirname + "/"
+            for pattern in exclude_patterns:
+                if check_path == pattern or check_path.startswith(pattern):
+                    dirs_to_remove.append(dirname)
+                    break
+
+        for dirname in dirs_to_remove:
+            dirnames.remove(dirname)
+
+        # Process files
         for fname in filenames:
             full = Path(dirpath) / fname
             try:
@@ -115,6 +150,7 @@ def build_file_index(root: Path) -> dict:
                 continue
             rel = str(full.relative_to(root))
             index[rel] = {"path": full, "size": st.st_size, "mtime": st.st_mtime}
+
     return index
 
 
@@ -123,6 +159,7 @@ def diff_trees_multi(
     dst_roots: list,          # list[Path]
     progress_cb=None,
     cancel_event=None,
+    exclude_patterns: list = None,
 ) -> list:
     """
     Compare source against all destinations.
@@ -138,11 +175,11 @@ def diff_trees_multi(
         progress_cb(0, 1, "Scanning directories…")
 
     def safe_index(root):
-        return build_file_index(root) if root.exists() else {}
+        return build_file_index(root, exclude_patterns) if root.exists() else {}
 
     all_roots = [src_root] + list(dst_roots)
     with ThreadPoolExecutor(max_workers=len(all_roots)) as ex:
-        futures = [ex.submit(build_file_index if i == 0 else safe_index, r)
+        futures = [ex.submit(lambda r, i=i: build_file_index(r, exclude_patterns) if i == 0 else safe_index(r), r)
                    for i, r in enumerate(all_roots)]
         indices = [f.result() for f in futures]
 
@@ -336,10 +373,11 @@ class ScanWorker(QThread):
     progress = pyqtSignal(int, int, str)
     finished = pyqtSignal(list)
 
-    def __init__(self, src_root, dst_roots):
+    def __init__(self, src_root, dst_roots, exclude_patterns=None):
         super().__init__()
         self.src_root = src_root
         self.dst_roots = dst_roots
+        self.exclude_patterns = exclude_patterns or []
         self.cancel_event = threading.Event()
 
     def run(self):
@@ -348,6 +386,7 @@ class ScanWorker(QThread):
             self.dst_roots,
             progress_cb=self.emit_progress,
             cancel_event=self.cancel_event,
+            exclude_patterns=self.exclude_patterns,
         )
         self.finished.emit(results)
 
@@ -400,17 +439,21 @@ class DestinationRow(QWidget):
     """A single destination row with entry and buttons."""
     removed = pyqtSignal(object)
 
-    def __init__(self, index, is_default=True, path="", parent=None):
+    def __init__(self, index, is_default=True, path="", is_ue_project=False, parent=None):
         super().__init__(parent)
         self.index = index
         self.is_default = is_default
+        self.is_ue_project = is_ue_project
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)
 
         # Label
-        label_text = "Destination (Place B):" if is_default else f"Destination {index + 1}:"
+        if is_ue_project:
+            label_text = f"Destination (Node {index}):"
+        else:
+            label_text = "Destination:" if is_default else f"Destination {index + 1}:"
         self.label = QLabel(label_text)
         self.label.setFixedWidth(180)
         self.label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -436,11 +479,20 @@ class DestinationRow(QWidget):
             layout.addWidget(self.remove_btn)
 
     def browse(self):
-        folder = QFileDialog.getExistingDirectory(
-            self, "Select Destination Folder",
-            options=QFileDialog.Option.DontUseNativeDialog,
-        )
-        if folder:
+        # Start with current path or home
+        start_dir = self.entry.text() or str(Path.home())
+
+        # Use Qt's custom dialog - shows files and folders, matches dark theme
+        dialog = QFileDialog(self)
+        dialog.setFileMode(QFileDialog.FileMode.Directory)
+        dialog.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+        dialog.setOption(QFileDialog.Option.ShowDirsOnly, False)
+        dialog.setWindowTitle("Select Destination Folder")
+        dialog.setDirectory(start_dir)
+        dialog.setViewMode(QFileDialog.ViewMode.Detail)
+
+        if dialog.exec():
+            folder = dialog.selectedFiles()[0]
             self.entry.setText(folder)
 
     def get_path(self):
@@ -460,6 +512,8 @@ class FileSyncApp(QMainWindow):
         self._dest_rows = []
         self._scan_worker = None
         self._sync_worker = None
+        self._is_ue_project = False
+        self._exclude_patterns = []
 
         self._setup_ui()
         self._apply_styles()
@@ -477,10 +531,10 @@ class FileSyncApp(QMainWindow):
         # Source row
         src_layout = QHBoxLayout()
         src_layout.setSpacing(12)
-        src_label = QLabel("Source (Place A):")
-        src_label.setFixedWidth(180)
-        src_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        src_layout.addWidget(src_label)
+        self.src_label = QLabel("Source:")
+        self.src_label.setFixedWidth(180)
+        self.src_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        src_layout.addWidget(self.src_label)
 
         self.src_entry = QLineEdit()
         self.src_entry.setObjectName("pathEntry")
@@ -796,7 +850,7 @@ class FileSyncApp(QMainWindow):
     def add_destination_row(self, path=""):
         index = len(self._dest_rows)
         is_default = index == 0
-        row = DestinationRow(index, is_default, path, self)
+        row = DestinationRow(index, is_default, path, self._is_ue_project, self)
         row.removed.connect(self.remove_destination_row)
         row.entry.textChanged.connect(self.save_settings)
         self.dest_layout.addWidget(row)
@@ -811,9 +865,13 @@ class FileSyncApp(QMainWindow):
 
     def renumber_destinations(self):
         for i, row in enumerate(self._dest_rows):
-            text = "Destination (Place B):" if i == 0 else f"Destination {i + 1}:"
+            if self._is_ue_project:
+                text = f"Destination (Node {i}):"
+            else:
+                text = "Destination:" if i == 0 else f"Destination {i + 1}:"
             row.set_label(text)
             row.index = i
+            row.is_ue_project = self._is_ue_project
 
     def get_dest_paths(self):
         """Return list of non-empty destination Path objects."""
@@ -827,13 +885,54 @@ class FileSyncApp(QMainWindow):
     # ── Browse ───────────────────────────────────────────────────
 
     def browse_source(self):
-        folder = QFileDialog.getExistingDirectory(
-            self, "Select Source Folder",
-            options=QFileDialog.Option.DontUseNativeDialog,
-        )
-        if folder:
+        # Start with current path or home
+        start_dir = self.src_entry.text() or str(Path.home())
+
+        # Use Qt's custom dialog - shows files and folders, matches dark theme
+        dialog = QFileDialog(self)
+        dialog.setFileMode(QFileDialog.FileMode.Directory)
+        dialog.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+        dialog.setOption(QFileDialog.Option.ShowDirsOnly, False)
+        dialog.setWindowTitle("Select Source Folder")
+        dialog.setDirectory(start_dir)
+        dialog.setViewMode(QFileDialog.ViewMode.Detail)
+
+        if dialog.exec():
+            folder = dialog.selectedFiles()[0]
             self.src_entry.setText(folder)
+            self.detect_ue_project(folder)
             self.save_settings()
+
+    def detect_ue_project(self, folder_path):
+        """Detect if the folder is an Unreal Engine project."""
+        folder = Path(folder_path)
+
+        # Look for .uproject files
+        uproject_files = list(folder.glob("*.uproject"))
+
+        if uproject_files:
+            # This is a UE project
+            self._is_ue_project = True
+            self._exclude_patterns = [
+                "Intermediate/",
+                "Saved/",
+                "DerivedDataCache/",
+                "Binaries/",
+                ".git/",
+                ".vs/",
+                ".vscode/",
+            ]
+            self.src_label.setText("Source (Editor / Control):")
+            self.log(f"✓ Unreal Engine project detected: {uproject_files[0].name}")
+            self.log(f"  Excluding: {', '.join(self._exclude_patterns)}")
+        else:
+            # Not a UE project
+            self._is_ue_project = False
+            self._exclude_patterns = []
+            self.src_label.setText("Source:")
+
+        # Update destination labels
+        self.renumber_destinations()
 
     # ── Scan ─────────────────────────────────────────────────────
 
@@ -871,7 +970,7 @@ class FileSyncApp(QMainWindow):
         for i, dp in enumerate(dst_paths):
             self.log(f"   D{i+1}     : {dp}")
 
-        self._scan_worker = ScanWorker(Path(src), dst_paths)
+        self._scan_worker = ScanWorker(Path(src), dst_paths, self._exclude_patterns)
         self._scan_worker.progress.connect(self.update_progress)
         self._scan_worker.finished.connect(self.scan_done)
         self._scan_worker.start()

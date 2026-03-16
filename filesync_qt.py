@@ -436,7 +436,10 @@ class DestinationRow(QWidget):
             layout.addWidget(self.remove_btn)
 
     def browse(self):
-        folder = QFileDialog.getExistingDirectory(self, "Select Destination Folder")
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select Destination Folder",
+            options=QFileDialog.Option.DontUseNativeDialog,
+        )
         if folder:
             self.entry.setText(folder)
 
@@ -505,7 +508,7 @@ class FileSyncApp(QMainWindow):
         add_dest_layout.addStretch()
         self.add_dest_btn = QPushButton("+ Add Destination")
         self.add_dest_btn.setObjectName("secondaryButton")
-        self.add_dest_btn.clicked.connect(self.add_destination_row)
+        self.add_dest_btn.clicked.connect(lambda: self.add_destination_row())
         add_dest_layout.addWidget(self.add_dest_btn)
         main_layout.addLayout(add_dest_layout)
 
@@ -824,7 +827,10 @@ class FileSyncApp(QMainWindow):
     # ── Browse ───────────────────────────────────────────────────
 
     def browse_source(self):
-        folder = QFileDialog.getExistingDirectory(self, "Select Source Folder")
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select Source Folder",
+            options=QFileDialog.Option.DontUseNativeDialog,
+        )
         if folder:
             self.src_entry.setText(folder)
             self.save_settings()

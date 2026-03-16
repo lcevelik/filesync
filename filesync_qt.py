@@ -539,6 +539,7 @@ class FileSyncApp(QMainWindow):
         self._sync_worker = None
         self._is_ue_project = False
         self._exclude_patterns = []
+        self._loading_settings = False  # Flag to prevent saving during load
 
         self._setup_ui()
         self._apply_styles()
@@ -934,7 +935,8 @@ class FileSyncApp(QMainWindow):
         folder = self.src_entry.text().strip()
         if folder and Path(folder).is_dir():
             self.detect_ue_project(folder)
-            self.save_settings()
+        # Save settings after any change (including clearing the field)
+        self.save_settings()
 
     def detect_ue_project(self, folder_path):
         """Detect if the folder is an Unreal Engine project."""
@@ -1178,27 +1180,53 @@ class FileSyncApp(QMainWindow):
         return Path.home() / ".filesync_settings.json"
 
     def save_settings(self):
+        # Don't save if we're currently loading settings
+        if self._loading_settings:
+            return
+
         data = {
             "src": self.src_entry.text(),
             "destinations": [row.get_path() for row in self._dest_rows],
         }
         try:
-            self.settings_path().write_text(json.dumps(data, indent=2))
-        except Exception:
-            pass
+            settings_file = self.settings_path()
+            settings_file.write_text(json.dumps(data, indent=2), encoding='utf-8')
+            print(f"[OK] Settings saved: {data}")
+        except Exception as e:
+            print(f"[ERROR] Saving settings: {e}")
 
     def load_settings(self):
+        self._loading_settings = True  # Prevent saves during load
         try:
-            data = json.loads(self.settings_path().read_text())
-            self.src_entry.setText(data.get("src", ""))
+            settings_file = self.settings_path()
+            if not settings_file.exists():
+                print("[INFO] No settings file found - first run")
+                return
 
+            data = json.loads(settings_file.read_text(encoding='utf-8'))
+            print(f"[LOAD] Settings: {data}")
+
+            # Load source path
+            src = data.get("src", "")
+            if src:
+                self.src_entry.setText(src)
+
+            # Load destination paths
             destinations = data.get("destinations", [""])
             if destinations:
-                self._dest_rows[0].entry.setText(destinations[0])
-            for path in destinations[1:]:
-                self.add_destination_row(path=path)
-        except Exception:
-            pass
+                # Set first destination
+                if destinations[0]:
+                    self._dest_rows[0].entry.setText(destinations[0])
+                # Add additional destinations
+                for path in destinations[1:]:
+                    if path:  # Only add non-empty paths
+                        self.add_destination_row(path=path)
+
+            print("[OK] Settings loaded successfully")
+        except Exception as e:
+            print(f"[ERROR] Loading settings: {e}")
+        finally:
+            self._loading_settings = False  # Re-enable saves
 
     def _load_settings(self):
         # Delay loading to ensure UI is ready

@@ -24,7 +24,7 @@ from PyQt6.QtWidgets import (
     QProgressBar, QTextEdit, QFileDialog, QMessageBox, QCheckBox,
     QFrame, QScrollArea, QSizePolicy
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl
 from PyQt6.QtGui import QFont, QColor, QPalette
 
 # ─────────────────────────────────────────────
@@ -435,6 +435,31 @@ class SyncWorker(QThread):
 # GUI
 # ─────────────────────────────────────────────
 
+class DropLineEdit(QLineEdit):
+    """QLineEdit that accepts folder/file drops from Finder."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dropEvent(self, event):
+        urls = event.mimeData().urls()
+        if urls:
+            path = urls[0].toLocalFile()
+            if os.path.isfile(path):
+                path = os.path.dirname(path)
+            self.setText(path)
+            event.acceptProposedAction()
+        else:
+            super().dropEvent(event)
+
+
 class DestinationRow(QWidget):
     """A single destination row with entry and buttons."""
     removed = pyqtSignal(object)
@@ -460,7 +485,7 @@ class DestinationRow(QWidget):
         layout.addWidget(self.label)
 
         # Entry
-        self.entry = QLineEdit(path)
+        self.entry = DropLineEdit(path)
         self.entry.setObjectName("pathEntry")
         layout.addWidget(self.entry, stretch=1)
 
@@ -536,7 +561,7 @@ class FileSyncApp(QMainWindow):
         self.src_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         src_layout.addWidget(self.src_label)
 
-        self.src_entry = QLineEdit()
+        self.src_entry = DropLineEdit()
         self.src_entry.setObjectName("pathEntry")
         src_layout.addWidget(self.src_entry, stretch=1)
 

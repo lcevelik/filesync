@@ -539,11 +539,11 @@ class FileSyncApp(QMainWindow):
         self._sync_worker = None
         self._is_ue_project = False
         self._exclude_patterns = []
-        self._loading_settings = False  # Flag to prevent saving during load
+        self._loading_settings = True  # Start as True to prevent saves during setup
 
         self._setup_ui()
         self._apply_styles()
-        self._load_settings()
+        self._load_settings()  # This will set _loading_settings to False when done
 
     def _setup_ui(self):
         # Central widget

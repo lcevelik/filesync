@@ -563,6 +563,7 @@ class FileSyncApp(QMainWindow):
 
         self.src_entry = DropLineEdit()
         self.src_entry.setObjectName("pathEntry")
+        self.src_entry.textChanged.connect(self.on_source_changed)  # Detect UE on text change
         src_layout.addWidget(self.src_entry, stretch=1)
 
         src_browse_btn = QPushButton("Browse…")
@@ -925,6 +926,13 @@ class FileSyncApp(QMainWindow):
         if dialog.exec():
             folder = dialog.selectedFiles()[0]
             self.src_entry.setText(folder)
+            # Detection happens via textChanged signal
+            self.save_settings()
+
+    def on_source_changed(self):
+        """Called when source path changes (browse, drag & drop, or manual entry)."""
+        folder = self.src_entry.text().strip()
+        if folder and Path(folder).is_dir():
             self.detect_ue_project(folder)
             self.save_settings()
 

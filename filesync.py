@@ -352,8 +352,7 @@ class FileSyncApp(tk.Tk):
         super().__init__()
         self.title("FileSync — Precision Sync")
         self.configure(bg=PALETTE["bg"])
-        # Fixed size: 1150×800 aspect ratio capped at 700px per side
-        w, h = 700, 487
+        w, h = 700, 530
         sw = self.winfo_screenwidth()
         sh = self.winfo_screenheight()
         x = (sw - w) // 2
@@ -877,7 +876,7 @@ class FileSyncApp(tk.Tk):
 
     def _save_settings(self):
         # Guard against being called before all widgets are constructed
-        if not hasattr(self, "_dest_rows"):
+        if not hasattr(self, "_dest_rows") or not hasattr(self, "_direction_var"):
             return
         data = {
             "src": self._src_var.get(),

@@ -22,7 +22,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QLineEdit, QTreeWidget, QTreeWidgetItem,
     QProgressBar, QTextEdit, QFileDialog, QMessageBox, QCheckBox,
-    QFrame, QScrollArea, QSizePolicy
+    QFrame, QScrollArea, QSizePolicy, QRadioButton, QButtonGroup
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl
 from PyQt6.QtGui import QFont, QColor, QPalette
@@ -593,6 +593,26 @@ class FileSyncApp(QMainWindow):
         add_dest_layout.addWidget(self.add_dest_btn)
         main_layout.addLayout(add_dest_layout)
 
+        # ── Direction ──────────────────────────────────────────────
+        dir_layout = QHBoxLayout()
+        dir_layout.setSpacing(12)
+        dir_label = QLabel("Direction:")
+        dir_label.setFixedWidth(180)
+        dir_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        dir_layout.addWidget(dir_label)
+
+        self._dir_group = QButtonGroup(self)
+        self._dir_fwd = QRadioButton("→  Src → Dst")
+        self._dir_rev = QRadioButton("←  Dst → Src")
+        self._dir_fwd.setChecked(True)
+        self._dir_group.addButton(self._dir_fwd, 0)
+        self._dir_group.addButton(self._dir_rev, 1)
+        self._dir_fwd.toggled.connect(self._on_direction_change)
+        dir_layout.addWidget(self._dir_fwd)
+        dir_layout.addWidget(self._dir_rev)
+        dir_layout.addStretch()
+        main_layout.addLayout(dir_layout)
+
         # ── Action buttons ─────────────────────────────────────────
         action_layout = QHBoxLayout()
         action_layout.setSpacing(12)
@@ -838,6 +858,24 @@ class FileSyncApp(QMainWindow):
                 border-color: #007aff;
                 image: url(data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTIiIGhlaWdodD0iMTIiIHZpZXdCb3g9IjAgMCAxMiAxMiIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTEwIDNMNC41IDguNUwyIDYiIHN0cm9rZT0id2hpdGUiIHN0cm9rZS13aWR0aD0iMiIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIiBzdHJva2UtbGluZWpvaW49InJvdW5kIi8+Cjwvc3ZnPgo=);
             }
+            QRadioButton {
+                spacing: 8px;
+                color: #e8e8e8;
+            }
+            QRadioButton::indicator {
+                width: 18px;
+                height: 18px;
+                border-radius: 9px;
+                border: 1px solid #3e3e42;
+                background-color: #2d2d30;
+            }
+            QRadioButton::indicator:hover {
+                border-color: #007aff;
+            }
+            QRadioButton::indicator:checked {
+                background-color: #007aff;
+                border-color: #007aff;
+            }
             QScrollBar:vertical {
                 background: #1e1e1e;
                 width: 12px;
@@ -871,6 +909,21 @@ class FileSyncApp(QMainWindow):
                 width: 0px;
             }
         """)
+
+    # ── Direction ────────────────────────────────────────────────
+
+    def _on_direction_change(self):
+        rev = self._dir_rev.isChecked()
+        self.sync_btn.setText("← Sync" if rev else "Sync →")
+        self.save_settings()
+
+    def get_effective_src_dsts(self):
+        """Return (effective_src: Path, effective_dsts: list[Path]) respecting direction."""
+        src = self.src_entry.text().strip()
+        dst_paths = self.get_dest_paths()
+        if self._dir_rev.isChecked() and dst_paths:
+            return dst_paths[0], [Path(src)]
+        return Path(src), dst_paths
 
     # ── Destination management ───────────────────────────────────
 
@@ -985,8 +1038,12 @@ class FileSyncApp(QMainWindow):
             QMessageBox.warning(self, "No destinations", "Add at least one destination folder.")
             return
 
-        # Ensure all destinations exist
-        for dp in dst_paths:
+        rev = self._dir_rev.isChecked()
+        effective_src, effective_dsts = self.get_effective_src_dsts()
+        direction_label = "← Dst→Src" if rev else "→ Src→Dst"
+
+        # Ensure all effective destinations exist
+        for dp in effective_dsts:
             if not dp.exists():
                 reply = QMessageBox.question(
                     self, "Create destination?",
@@ -1000,12 +1057,12 @@ class FileSyncApp(QMainWindow):
 
         self.set_busy(True)
         self.tree.clear()
-        self.log(f"── Scan started {datetime.now():%Y-%m-%d %H:%M:%S} ──")
-        self.log(f"   Source : {src}")
-        for i, dp in enumerate(dst_paths):
-            self.log(f"   D{i+1}     : {dp}")
+        self.log(f"── Scan started {datetime.now():%Y-%m-%d %H:%M:%S} ({direction_label}) ──")
+        self.log(f"   From  : {effective_src}")
+        for i, dp in enumerate(effective_dsts):
+            self.log(f"   To D{i+1} : {dp}")
 
-        self._scan_worker = ScanWorker(Path(src), dst_paths, self._exclude_patterns)
+        self._scan_worker = ScanWorker(effective_src, effective_dsts, self._exclude_patterns)
         self._scan_worker.progress.connect(self.update_progress)
         self._scan_worker.finished.connect(self.scan_done)
         self._scan_worker.start()
@@ -1035,16 +1092,19 @@ class FileSyncApp(QMainWindow):
             QMessageBox.information(self, "Nothing to sync", "All destinations are up to date.")
             return
 
-        dst_paths = self.get_dest_paths()
-        if not dst_paths:
+        rev = self._dir_rev.isChecked()
+        _, effective_dsts = self.get_effective_src_dsts()
+        if not effective_dsts:
             QMessageBox.warning(self, "No destinations", "No destination folders configured.")
             return
 
+        direction_label = "← Dst→Src" if rev else "→ Src→Dst"
         del_count = sum(1 for e in to_sync if e.overall_status == FileStatus.DEST_ONLY)
-        dest_labels = [f"D{i+1}: {p}" for i, p in enumerate(dst_paths)]
+        dest_labels = [f"D{i+1}: {p}" for i, p in enumerate(effective_dsts)]
         msg = (
+            f"Direction: {direction_label}\n"
             f"About to sync {len(to_sync)} file(s) to "
-            f"{len(dst_paths)} destination(s):\n\n"
+            f"{len(effective_dsts)} destination(s):\n\n"
             + "\n".join(dest_labels)
         )
         if del_count:
@@ -1059,9 +1119,9 @@ class FileSyncApp(QMainWindow):
             return
 
         self.set_busy(True)
-        self.log(f"── Sync started {datetime.now():%Y-%m-%d %H:%M:%S} ──")
+        self.log(f"── Sync started {datetime.now():%Y-%m-%d %H:%M:%S} ({direction_label}) ──")
 
-        self._sync_worker = SyncWorker(self._entries, dst_paths)
+        self._sync_worker = SyncWorker(self._entries, effective_dsts)
         self._sync_worker.progress.connect(self.update_progress)
         self._sync_worker.log.connect(self.log)
         self._sync_worker.finished.connect(self.sync_done)
@@ -1187,6 +1247,7 @@ class FileSyncApp(QMainWindow):
         data = {
             "src": self.src_entry.text(),
             "destinations": [row.get_path() for row in self._dest_rows],
+            "direction": "rev" if self._dir_rev.isChecked() else "fwd",
         }
         try:
             settings_file = self.settings_path()
@@ -1221,6 +1282,11 @@ class FileSyncApp(QMainWindow):
                 for path in destinations[1:]:
                     if path:  # Only add non-empty paths
                         self.add_destination_row(path=path)
+
+            if data.get("direction") == "rev":
+                self._dir_rev.setChecked(True)
+            else:
+                self._dir_fwd.setChecked(True)
 
             print("[OK] Settings loaded successfully")
         except Exception as e:

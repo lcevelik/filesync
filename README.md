@@ -98,9 +98,11 @@ python filesync_qt.py
 - Perfect for syncing to multiple build machines or backup locations
 
 ### Sync Direction
-- **→ Src → Dst** (default) — copy from source to destination(s)
-- **← Dst → Src** — reverse sync: copy from first destination back to source
-- Useful for pulling updates from a remote/backup location
+- **→ Src → Dst** (default) — copy from source to all destination(s)
+- **← Dst → Src** — reverse sync: copy from **D1 (first destination) back to source**
+  - Only D1 is used as the read source in reverse mode
+  - Additional destinations (D2, D3…) are not involved
+- Useful for pulling updates from a backup or remote location back to your working folder
 
 ## 🛠️ Building from Source
 

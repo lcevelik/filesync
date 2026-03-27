@@ -1,5 +1,5 @@
 """
-FileSync - Precision file synchronization tool
+SyncFlow - Precision file synchronization tool
 Designed for Unreal Engine projects (and any large file trees)
 Supports multiple destinations.
 PyQt6 version with modern UI
@@ -530,7 +530,7 @@ class DestinationRow(QWidget):
 class FileSyncApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("FileSync — Precision Sync")
+        self.setWindowTitle("SyncFlow v1.0.1 — Precision Sync")
         self.resize(1000, 750)
 
         self._entries = []

@@ -538,7 +538,19 @@ class FileSyncApp(tk.Tk):
         )
 
     def _build_options_row(self, parent):
-        pass
+        row = tk.Frame(parent, bg=PALETTE["bg"])
+        row.pack(fill="x", pady=4)
+        tk.Label(row, text="Direction:", bg=PALETTE["bg"], fg=PALETTE["text"],
+                 font=("Segoe UI", 9), width=19, anchor="e").pack(side="left")
+        self._direction_var = tk.StringVar(value="fwd")
+        for label, val in (("→  Src → Dst", "fwd"), ("←  Dst → Src", "rev")):
+            tk.Radiobutton(row, text=label,
+                           variable=self._direction_var, value=val,
+                           bg=PALETTE["bg"], fg=PALETTE["text"],
+                           selectcolor=PALETTE["surface"],
+                           activebackground=PALETTE["bg"],
+                           font=("Segoe UI", 9),
+                           command=self._on_direction_change).pack(side="left", padx=8)
 
     # ── Destination rows ─────────────────────────────────────────────
 
@@ -585,6 +597,19 @@ class FileSyncApp(tk.Tk):
             text = "Destination (Place B):" if i == 0 else f"Destination {i + 1}:"
             row["label"].config(text=text)
 
+    def _on_direction_change(self):
+        rev = self._direction_var.get() == "rev"
+        self._btn_sync.config(text="← Sync" if rev else "Sync →")
+        self._save_settings()
+
+    def _effective_src_dsts(self):
+        """Return (effective_src: Path, effective_dsts: list[Path]) respecting direction."""
+        src = self._src_var.get().strip()
+        dst_paths = self._dest_paths()
+        if self._direction_var.get() == "rev" and dst_paths:
+            return dst_paths[0], [Path(src)]
+        return Path(src), dst_paths
+
     def _dest_paths(self) -> list:
         """Return list of non-empty destination Path objects."""
         paths = []
@@ -625,8 +650,11 @@ class FileSyncApp(tk.Tk):
             messagebox.showwarning("No destinations", "Add at least one destination folder.")
             return
 
-        # Ensure all destinations exist (offer to create)
-        for dp in dst_paths:
+        rev = self._direction_var.get() == "rev"
+        effective_src, effective_dsts = self._effective_src_dsts()
+
+        # Ensure all effective destinations exist (offer to create)
+        for dp in effective_dsts:
             if not dp.exists():
                 if messagebox.askyesno("Create destination?",
                                         f"Destination does not exist:\n{dp}\n\nCreate it?"):
@@ -637,14 +665,15 @@ class FileSyncApp(tk.Tk):
         self._cancel_event.clear()
         self._set_busy(True)
         self._clear_tree()
-        self._log(f"── Scan started {datetime.now():%Y-%m-%d %H:%M:%S} ──")
-        self._log(f"   Source : {src}")
-        for i, dp in enumerate(dst_paths):
-            self._log(f"   D{i+1}     : {dp}")
+        direction_label = "← Dst→Src" if rev else "→ Src→Dst"
+        self._log(f"── Scan started {datetime.now():%Y-%m-%d %H:%M:%S} ({direction_label}) ──")
+        self._log(f"   From  : {effective_src}")
+        for i, dp in enumerate(effective_dsts):
+            self._log(f"   To D{i+1} : {dp}")
 
         def run():
             results = diff_trees_multi(
-                Path(src), dst_paths,
+                effective_src, effective_dsts,
                 progress_cb=self._update_progress,
                 cancel_event=self._cancel_event,
             )
@@ -678,20 +707,19 @@ class FileSyncApp(tk.Tk):
             messagebox.showinfo("Nothing to sync", "All destinations are up to date.")
             return
 
-        dst_paths = self._dest_paths()
-        if not dst_paths:
+        rev = self._direction_var.get() == "rev"
+        _, effective_dsts = self._effective_src_dsts()
+        if not effective_dsts:
             messagebox.showwarning("No destinations", "No destination folders configured.")
             return
 
-        # Build summary for confirmation dialog
-        del_count = sum(
-            1 for e in to_sync
-            if e.overall_status == FileStatus.DEST_ONLY and True
-        )
-        dest_labels = [f"D{i+1}: {p}" for i, p in enumerate(dst_paths)]
+        direction_label = "← Dst→Src" if rev else "→ Src→Dst"
+        del_count = sum(1 for e in to_sync if e.overall_status == FileStatus.DEST_ONLY)
+        dest_labels = [f"D{i+1}: {p}" for i, p in enumerate(effective_dsts)]
         msg = (
+            f"Direction: {direction_label}\n"
             f"About to sync {len(to_sync)} file(s) to "
-            f"{len(dst_paths)} destination(s):\n\n"
+            f"{len(effective_dsts)} destination(s):\n\n"
             + "\n".join(dest_labels)
         )
         if del_count:
@@ -702,12 +730,12 @@ class FileSyncApp(tk.Tk):
 
         self._cancel_event.clear()
         self._set_busy(True)
-        self._log(f"── Sync started {datetime.now():%Y-%m-%d %H:%M:%S} ──")
+        self._log(f"── Sync started {datetime.now():%Y-%m-%d %H:%M:%S} ({direction_label}) ──")
 
         def run():
             stats = sync_files_multi(
                 self._entries,
-                dst_roots=dst_paths,
+                dst_roots=effective_dsts,
                 copy_new=True,
                 copy_modified=True,
                 delete_dest_only=True,
@@ -715,7 +743,7 @@ class FileSyncApp(tk.Tk):
                 cancel_event=self._cancel_event,
                 log_cb=lambda msg: self.after(0, self._log, msg),
             )
-            self.after(0, self._sync_done, stats, dst_paths)
+            self.after(0, self._sync_done, stats, effective_dsts)
 
         self._worker = threading.Thread(target=run, daemon=True)
         self._worker.start()
@@ -854,6 +882,7 @@ class FileSyncApp(tk.Tk):
         data = {
             "src": self._src_var.get(),
             "destinations": [row["var"].get() for row in self._dest_rows],
+            "direction": self._direction_var.get(),
         }
         try:
             self._settings_path().write_text(json.dumps(data, indent=2))
@@ -864,6 +893,8 @@ class FileSyncApp(tk.Tk):
         try:
             data = json.loads(self._settings_path().read_text())
             self._src_var.set(data.get("src", ""))
+            self._direction_var.set(data.get("direction", "fwd"))
+            self._on_direction_change()
 
             destinations = data.get("destinations", [""])
             # First destination is already created by _add_dest_row() in __init__

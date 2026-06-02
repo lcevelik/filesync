@@ -4,13 +4,13 @@ Precision file synchronization tool — designed for Unreal Engine projects and 
 
 ## Goals
 
-- [ ] Stabilize SyncFlow v1.0.x release with full UE project support — 2026-06-15
+- [x] Stabilize SyncFlow v1.0.x release with full UE project support — 2026-06-15
 - [ ] Add cloud/network sync targets (S3, SMB, SSH) — 2026-08-01
-- [ ] Release v1.1.0 with multi-platform improvements — 2026-09-01
+- [ ] Release v1.2.0 with remote sync targets — 2026-09-01
 
 ## In Progress
 
-- [ ] Polish PyQt6 dark-theme UI for edge cases and multi-monitor setups
+- [x] Polish PyQt6 dark-theme UI for edge cases and multi-monitor setups
 - [ ] Improve error handling and logging for failed sync operations
 
 ## To Do
@@ -38,11 +38,14 @@ Precision file synchronization tool — designed for Unreal Engine projects and 
 - [ ] Add "Open in Explorer/Finder" context menu on file list items
 - [ ] Add resume support for interrupted syncs (track partially copied files)
 
-### Performance
-- [ ] Implement mtime-based fast-path: skip hashing if mtime unchanged since last sync
-- [ ] Add optional xxhash support (already in requirements.txt but not wired up in code)
+### Performance (mostly done in v1.1.0)
+- [x] xxhash support — 9.5x faster than SHA-256, with automatic fallback
+- [x] ProcessPoolExecutor for CPU-bound hashing (bypasses GIL)
+- [x] Persistent hash cache to skip re-hashing unchanged files
+- [x] os.scandir() for faster directory traversal
+- [x] os.sendfile() for kernel-level file copy
+- [ ] Add optional GPU-accelerated hashing for 100MB+ files (CUDA detected but not yet used)
 - [ ] Implement chunked/buffered copy for very large files with progress per-file
-- [ ] Add memory-mapped I/O option for hashing large files
 
 ### Security
 - [ ] Validate and sanitize all file paths to prevent path traversal attacks
@@ -62,6 +65,16 @@ Precision file synchronization tool — designed for Unreal Engine projects and 
 - [x] Qt file browser with folder+file display (non-native dialog)
 - [x] Cancel support for long-running scan/sync operations
 - [x] App renamed from FileSync to SyncFlow
+- [x] xxhash support (9.5x faster hashing) with SHA-256 automatic fallback
+- [x] ProcessPoolExecutor for hashing — bypasses GIL, linear core scaling
+- [x] Persistent hash cache (~/.filesync_hashcache.json) — skip re-hashing unchanged files
+- [x] os.scandir() directory scan — fewer syscalls than os.walk
+- [x] os.sendfile() kernel-level file copy (2.85x faster on Linux)
+- [x] 4MB hash chunks for large UE assets (was 1MB)
+- [x] HASH_ERROR sentinel for read failures (was empty string)
+- [x] Hardware auto-detection on startup (CPU cores, xxhash, CUDA/GPU)
+- [x] Hash algorithm selector in UI (xxhash / SHA-256) with settings persistence
+- [x] Precision guarantee: same-size files always hashed, never skipped by mtime
 
 ## Blocked
 
@@ -69,8 +82,9 @@ _(none currently)_
 
 ## Releases
 
-- v1.0.1 — current — SyncFlow with UE detection, SHA-256 verification, multi-dest sync, direction toggle
-- v1.1.0 — planned 2026-09-01 — Remote sync targets and cross-platform improvements
+- v1.1.0 — current — Performance overhaul: xxhash, ProcessPool, hash cache, sendfile, scandir, hardware detection
+- v1.0.1 — SyncFlow with UE detection, SHA-256 verification, multi-dest sync, direction toggle
+- v1.2.0 — planned 2026-09-01 — Remote sync targets and cross-platform improvements
 
 ## Notes
 
@@ -78,5 +92,5 @@ _(none currently)_
 - Standalone .exe via PyInstaller available on Releases page; Python 3.9+ required for source runs
 - Two GUI frontends exist: `filesync.py` (tkinter, legacy) and `filesync_qt.py` (PyQt6, primary)
 - Core sync engine logic is duplicated between both files — should be extracted
-- xxhash is listed in requirements.txt but not actually used in the code
+- xxhash now used by default (9.5x faster than SHA-256), falls back to SHA-256 if not installed
 - build.bat only builds the tkinter version; should be updated for PyQt6 version

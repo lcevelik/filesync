@@ -1,6 +1,6 @@
 @echo off
 echo ========================================
-echo  FileSync - Build .exe
+echo  SyncFlow v1.1.0 - Build .exe
 echo ========================================
 
 :: Check Python
@@ -11,18 +11,18 @@ if errorlevel 1 (
     exit /b 1
 )
 
-:: Install PyInstaller if needed
-echo Installing/checking PyInstaller...
-pip install pyinstaller --quiet
+:: Install dependencies if needed
+echo Installing/checking dependencies...
+pip install pyinstaller xxhash PyQt6 --quiet
 
-:: Build single-file .exe
-echo Building filesync.exe ...
+:: Build single-file .exe (PyQt6 version)
+echo Building SyncFlow_v1.1.0.exe ...
 pyinstaller ^
     --onefile ^
     --windowed ^
-    --name "FileSync" ^
+    --name "SyncFlow_v1.1.0" ^
     --icon NONE ^
-    filesync.py
+    filesync_qt.py --clean
 
 if errorlevel 1 (
     echo.
@@ -34,6 +34,6 @@ if errorlevel 1 (
 echo.
 echo ========================================
 echo  SUCCESS! Executable is at:
-echo  dist\FileSync.exe
+echo  dist\SyncFlow_v1.1.0.exe
 echo ========================================
 pause

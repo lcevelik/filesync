@@ -4,3 +4,4 @@ __pycache__/
 *.spec
 *.pyc
 .filesync_settings.json
+.filesync_hashcache.json

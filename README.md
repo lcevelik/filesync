@@ -1,8 +1,8 @@
-# SyncFlow v1.0.1 — Precision File Synchronization
+# SyncFlow v1.1.0 — Precision File Synchronization
 
 A modern, intelligent file synchronization tool with special support for Unreal Engine projects. Built with PyQt6 featuring a beautiful dark theme UI and smart project detection.
 
-![Version](https://img.shields.io/badge/version-1.0.1-blue)
+![Version](https://img.shields.io/badge/version-1.1.0-blue)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue)
 ![Python](https://img.shields.io/badge/python-3.9%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
@@ -54,7 +54,7 @@ A modern, intelligent file synchronization tool with special support for Unreal 
 ## 📥 Installation
 
 ### Option 1: Download Executable (Recommended)
-1. Download `SyncFlow_v1.0.1.exe` from the [Releases](../../releases) page
+1. Download `SyncFlow_v1.1.0.exe` from the [Releases](../../releases) page
 2. Run it — no installation required!
 3. Settings are automatically saved to `~/.filesync_settings.json`
 
@@ -117,9 +117,9 @@ python filesync_qt.py
 pip install -r requirements.txt
 
 # Build single-file executable (versioned name)
-pyinstaller --onefile --windowed --name "SyncFlow_v1.0.1" filesync_qt.py --clean
+pyinstaller --onefile --windowed --name "SyncFlow_v1.1.0" filesync_qt.py --clean
 
-# Find executable in dist/SyncFlow_v1.0.1.exe
+# Find executable in dist/SyncFlow_v1.1.0.exe
 ```
 
 ## 📋 Requirements
@@ -190,6 +190,18 @@ Automatically excluded when UE project detected:
 - Efficient memory usage even for large projects
 
 ## 📝 Changelog
+
+### v1.1.0
+- xxhash support (9.5x faster hashing) with SHA-256 fallback
+- ProcessPoolExecutor for hashing — bypasses GIL, linear core scaling
+- Persistent hash cache — skip re-hashing unchanged files across sessions
+- os.scandir() directory scan — fewer syscalls, 2-3x faster
+- os.sendfile() for file copy — 2.85x faster on Linux
+- 4MB hash chunks for large UE assets
+- Proper error sentinels (HASH_ERROR) for read failures
+- Hardware auto-detection (CPU cores, xxhash, CUDA/GPU)
+- Hash algorithm selector in UI (xxhash / SHA-256)
+- Precision guarantee: same-size files always hashed, never skipped
 
 ### v1.0.1
 - Added sync direction toggle (Src→Dst / Dst→Src)

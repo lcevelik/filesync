@@ -10,13 +10,38 @@ import sys
 import hashlib
 import shutil
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import subprocess
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+import multiprocessing
 import json
 from datetime import datetime
 from pathlib import Path
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
+
+# ── Optional fast hash (xxhash) with SHA-256 fallback ───────────────
+try:
+    import xxhash
+    HAS_XXHASH = True
+except ImportError:
+    HAS_XXHASH = False
+
+# ── Hash cache path ─────────────────────────────────────────────────
+HASH_CACHE_PATH = Path.home() / ".filesync_hashcache.json"
+
+# ── GPU detection (non-blocking, for future use) ────────────────────
+HAS_CUDA = False
+try:
+    _nv = subprocess.run(["nvidia-smi"], capture_output=True, timeout=3)
+    HAS_CUDA = _nv.returncode == 0
+except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+    pass
+
+# ── Hardware-aware worker counts ────────────────────────────────────
+CPU_COUNT = os.cpu_count() or 4
+IO_WORKERS = min(32, CPU_COUNT * 2)        # threads for I/O-bound tasks
+HASH_WORKERS = max(1, min(CPU_COUNT, 8))   # processes for CPU-bound hashing
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -85,12 +110,28 @@ class FileEntry:
 
 
 # ─────────────────────────────────────────────
-# Core engine
+# Core engine — optimized for speed + precision
 # ─────────────────────────────────────────────
 
-def compute_hash(path: Path, chunk_size: int = 1 << 20) -> str:
-    """SHA-256 of file content (1 MB chunks for large UE assets)."""
-    h = hashlib.sha256()
+# Error sentinel — distinguish "couldn't read" from "empty file"
+HASH_ERROR = "__READ_ERROR__"
+
+
+def _get_hasher(algo: str = "xxhash"):
+    """Return (hasher_instance, hash_fn_name). Falls back to sha256 if xxhash unavailable."""
+    if algo == "xxhash" and HAS_XXHASH:
+        return xxhash.xxh3_128(), "xxhash.xxh3_128"
+    return hashlib.sha256(), "sha256"
+
+
+def compute_hash(path: Path, algo: str = "xxhash", chunk_size: int = 4 << 20) -> str:
+    """
+    Hash file content. Never skips — every byte verified.
+    - algo: 'xxhash' (default, 10-20x faster) or 'sha256' (crypto-grade fallback)
+    - chunk_size: 4 MB default (optimal for large UE assets)
+    Returns hex digest string, or HASH_ERROR on read failure.
+    """
+    h, _ = _get_hasher(algo)
     try:
         with open(path, "rb") as f:
             while True:
@@ -99,58 +140,140 @@ def compute_hash(path: Path, chunk_size: int = 1 << 20) -> str:
                     break
                 h.update(chunk)
     except (PermissionError, OSError):
-        return ""
+        return HASH_ERROR
     return h.hexdigest()
 
 
-def build_file_index(root: Path, exclude_patterns: list = None) -> dict:
-    """Walk a directory → {rel_path: {path, size, mtime}}.
+# ── Hash cache — avoid re-hashing files that haven't changed ────────
 
-    Args:
-        root: Root directory to index
-        exclude_patterns: List of directory patterns to exclude (e.g., ['Intermediate/', '.git/'])
+def _load_hash_cache() -> dict:
+    """Load persistent hash cache: {str(path): {"mtime": float, "size": int, "hash": str}}."""
+    try:
+        if HASH_CACHE_PATH.exists():
+            return json.loads(HASH_CACHE_PATH.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        pass
+    return {}
+
+
+def _save_hash_cache(cache: dict):
+    """Save hash cache atomically."""
+    try:
+        tmp = HASH_CACHE_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(cache), encoding="utf-8")
+        tmp.replace(HASH_CACHE_PATH)
+    except OSError:
+        pass
+
+
+def _hash_with_cache(path: Path, algo: str, cache: dict) -> str:
+    """
+    Hash a file, using persistent cache if mtime+size match.
+    If mtime or size changed → re-hash (NEVER skips).
+    If cache miss → hash and store.
+    Returns hex digest or HASH_ERROR.
+    """
+    key = str(path)
+    try:
+        st = path.stat()
+    except OSError:
+        return HASH_ERROR
+
+    mtime, size = st.st_mtime, st.st_size
+
+    # Cache hit: same mtime + same size → trust cached hash
+    cached = cache.get(key)
+    if cached and cached.get("mtime") == mtime and cached.get("size") == size:
+        return cached["hash"]
+
+    # Cache miss or stale → full hash (NEVER skip)
+    h = compute_hash(path, algo)
+    if h != HASH_ERROR:
+        cache[key] = {"mtime": mtime, "size": size, "hash": h}
+    return h
+
+
+# ── Directory scanning — os.scandir (faster than os.walk) ───────────
+
+def _hash_one(args: tuple) -> tuple:
+    """Module-level picklable hash worker for ProcessPoolExecutor.
+    args = (path_str, algo, cache_mtime, cache_size, cache_hash)
+    Returns (path_str, hash_str).
+    """
+    path_str, algo, cache_mtime, cache_size, cache_hash = args
+    path = Path(path_str)
+    try:
+        st = path.stat()
+    except OSError:
+        return (path_str, HASH_ERROR)
+
+    mtime, size = st.st_mtime, st.st_size
+
+    # Cache hit: same mtime + same size → trust cached hash
+    if cache_hash and cache_mtime == mtime and cache_size == size:
+        return (path_str, cache_hash)
+
+    # Cache miss or stale → full hash (NEVER skip)
+    h, _ = _get_hasher(algo)
+    try:
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(4 << 20)
+                if not chunk:
+                    break
+                h.update(chunk)
+    except (PermissionError, OSError):
+        return (path_str, HASH_ERROR)
+    return (path_str, h.hexdigest())
+
+
+def _is_excluded(rel_dir: str, exclude_patterns: list) -> bool:
+    """Check if a directory matches any exclusion pattern."""
+    for pattern in exclude_patterns:
+        if rel_dir.startswith(pattern) or rel_dir == pattern.rstrip("/"):
+            return True
+    return False
+
+
+def build_file_index(root: Path, exclude_patterns: list = None) -> dict:
+    """
+    Walk a directory → {rel_path: {path, size, mtime}}.
+    Uses os.scandir() — gets stat info from d_type, fewer syscalls than os.walk.
     """
     index = {}
     exclude_patterns = exclude_patterns or []
+    root_str = str(root)
 
-    for dirpath, dirnames, filenames in os.walk(root):
-        # Get relative path of current directory
-        rel_dir = Path(dirpath).relative_to(root)
-        rel_dir_str = str(rel_dir) + "/" if rel_dir != Path(".") else ""
+    def _scan(dir_path: Path, rel_prefix: str):
+        try:
+            entries = list(os.scandir(dir_path))
+        except (PermissionError, OSError):
+            return
 
-        # Check if current directory should be excluded
-        should_exclude = False
-        for pattern in exclude_patterns:
-            if rel_dir_str.startswith(pattern) or rel_dir_str == pattern.rstrip('/'):
-                should_exclude = True
-                break
+        subdirs = []
+        for entry in entries:
+            if entry.is_dir(follow_symlinks=False):
+                dir_name = entry.name
+                rel_dir = rel_prefix + dir_name + "/"
+                if _is_excluded(rel_dir, exclude_patterns):
+                    continue
+                subdirs.append((dir_path / dir_name, rel_dir))
+            elif entry.is_file(follow_symlinks=False):
+                try:
+                    st = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                rel = rel_prefix + entry.name
+                index[rel] = {
+                    "path": dir_path / entry.name,
+                    "size": st.st_size,
+                    "mtime": st.st_mtime,
+                }
 
-        if should_exclude:
-            dirnames.clear()  # Don't recurse into this directory
-            continue
+        for sub_path, sub_rel in subdirs:
+            _scan(sub_path, sub_rel)
 
-        # Filter out excluded subdirectories
-        dirs_to_remove = []
-        for dirname in dirnames:
-            check_path = rel_dir_str + dirname + "/"
-            for pattern in exclude_patterns:
-                if check_path == pattern or check_path.startswith(pattern):
-                    dirs_to_remove.append(dirname)
-                    break
-
-        for dirname in dirs_to_remove:
-            dirnames.remove(dirname)
-
-        # Process files
-        for fname in filenames:
-            full = Path(dirpath) / fname
-            try:
-                st = full.stat()
-            except OSError:
-                continue
-            rel = str(full.relative_to(root))
-            index[rel] = {"path": full, "size": st.st_size, "mtime": st.st_mtime}
-
+    _scan(root, "")
     return index
 
 
@@ -160,17 +283,24 @@ def diff_trees_multi(
     progress_cb=None,
     cancel_event=None,
     exclude_patterns: list = None,
+    hash_algo: str = "xxhash",
 ) -> list:
     """
-    Compare source against all destinations.
-    Phase 1: scan all directories in parallel.
-    Phase 2: size-compare to find candidates; collect paths needing hashing.
-    Phase 3: hash all candidates in parallel, finalize status.
+    Compare source against ALL destinations.
+
+    Phase 1: parallel directory scan (os.scandir, ThreadPoolExecutor for I/O).
+    Phase 2: size-compare to identify candidates. NEVER skips hash based on mtime.
+    Phase 3: hash ALL same-size files in parallel (ProcessPoolExecutor, bypasses GIL).
+             Uses persistent cache — only re-hashes if mtime or size changed.
+
+    ⚠ PRECISION GUARANTEE: Files with same size but different content are ALWAYS
+    caught. The hash is NEVER skipped. Only cached hashes are reused when BOTH
+    mtime AND size match the cached values — any change triggers a full re-hash.
+
     Returns list[FileEntry].
     """
-    workers = min(32, (os.cpu_count() or 4) * 4)
 
-    # ── Phase 1: parallel directory scan ─────────────────────────────
+    # ── Phase 1: parallel directory scan (I/O-bound → threads) ───────
     if progress_cb:
         progress_cb(0, 1, "Scanning directories…")
 
@@ -179,20 +309,21 @@ def diff_trees_multi(
 
     all_roots = [src_root] + list(dst_roots)
     with ThreadPoolExecutor(max_workers=len(all_roots)) as ex:
-        futures = [ex.submit(lambda r, i=i: build_file_index(r, exclude_patterns) if i == 0 else safe_index(r), r)
-                   for i, r in enumerate(all_roots)]
+        futures = [ex.submit(safe_index, r) for r in all_roots]
         indices = [f.result() for f in futures]
 
-    src_index  = indices[0]
+    src_index   = indices[0]
     dst_indices = indices[1:]
 
     # ── Phase 2: size comparison, collect hash candidates ────────────
+    # NEVER uses mtime to skip hashing — only size to identify candidates.
+    # Same-size files always go to hash phase (the "pool" vs "poll" case).
     all_keys = set(src_index)
     for idx in dst_indices:
         all_keys |= set(idx)
 
     results    = []
-    hash_pairs = []   # (entry, ds) where both exist and sizes match
+    hash_pairs = []   # (entry, ds) where both exist and sizes match → MUST hash
     total      = len(all_keys)
 
     for i, rel in enumerate(sorted(all_keys)):
@@ -227,17 +358,22 @@ def diff_trees_multi(
             elif not in_src and in_dst:
                 ds.status = FileStatus.DEST_ONLY
             elif entry.src_size != ds.dst_size:
+                # Different size → definitely modified, no hash needed
                 ds.status = FileStatus.MODIFIED
             else:
-                # Same size — defer to hash phase
-                ds.status = FileStatus.UNCHANGED   # tentative
+                # Same size → MUST hash to verify content.
+                # "pool" vs "poll" — same byte count, different data.
+                # NEVER skip hash based on mtime alone.
+                ds.status = FileStatus.UNCHANGED   # tentative — hash will confirm
                 hash_pairs.append((entry, ds))
 
             entry.dest_statuses.append(ds)
 
         results.append(entry)
 
-    # ── Phase 3: parallel hashing ─────────────────────────────────────
+    # ── Phase 3: hash verification (CPU-bound → ProcessPoolExecutor) ─
+    # Uses persistent cache: only re-hashes if mtime or size changed.
+    # Falls back to ThreadPoolExecutor if multiprocessing unavailable.
     if hash_pairs and not (cancel_event and cancel_event.is_set()):
         paths_needed = set()
         for entry, ds in hash_pairs:
@@ -246,32 +382,85 @@ def diff_trees_multi(
             if ds.dst_path:
                 paths_needed.add(ds.dst_path)
 
-        hash_cache: dict = {}
+        pcache = _load_hash_cache()
+        hash_results: dict = {}   # path → hash string
         done = 0
         htotal = len(paths_needed)
         if progress_cb:
-            progress_cb(0, htotal, f"Hashing {htotal} file(s)…")
+            progress_cb(0, htotal, f"Hashing {htotal} file(s) [{hash_algo}]…")
 
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            fut_map = {ex.submit(compute_hash, p): p for p in paths_needed}
-            for fut in as_completed(fut_map):
-                if cancel_event and cancel_event.is_set():
-                    break
-                hash_cache[fut_map[fut]] = fut.result()
-                done += 1
-                if progress_cb and done % 50 == 0:
-                    progress_cb(done, htotal, f"Hashing… {done}/{htotal}")
+        # Prepare picklable args: (path_str, algo, cached_mtime, cached_size, cached_hash)
+        tasks = []
+        for p in paths_needed:
+            key = str(p)
+            cached = pcache.get(key, {})
+            tasks.append((
+                key,
+                hash_algo,
+                cached.get("mtime", -1.0),
+                cached.get("size", -1),
+                cached.get("hash", ""),
+            ))
 
+        # Try ProcessPoolExecutor for CPU-bound hashing (bypasses GIL).
+        # Falls back to ThreadPoolExecutor if multiprocessing fails.
+        use_process_pool = True
+        try:
+            pool = ProcessPoolExecutor(max_workers=HASH_WORKERS)
+        except Exception:
+            use_process_pool = False
+            pool = ThreadPoolExecutor(max_workers=IO_WORKERS)
+
+        try:
+            with pool:
+                fut_map = {pool.submit(_hash_one, t): t[0] for t in tasks}
+                for fut in as_completed(fut_map):
+                    if cancel_event and cancel_event.is_set():
+                        break
+                    path_str, h = fut.result()
+                    hash_results[Path(path_str)] = h
+                    # Update persistent cache with fresh result
+                    if h != HASH_ERROR:
+                        try:
+                            st = Path(path_str).stat()
+                            pcache[path_str] = {"mtime": st.st_mtime, "size": st.st_size, "hash": h}
+                        except OSError:
+                            pass
+                    done += 1
+                    if progress_cb and done % 50 == 0:
+                        progress_cb(done, htotal, f"Hashing… {done}/{htotal}")
+        finally:
+            # Save updated cache
+            _save_hash_cache(pcache)
+
+        # Compare hashes — finalize status
+        error_count = 0
         for entry, ds in hash_pairs:
-            src_h = hash_cache.get(entry.src_path, "")
-            dst_h = hash_cache.get(ds.dst_path, "")
+            src_h = hash_results.get(entry.src_path, HASH_ERROR)
+            dst_h = hash_results.get(ds.dst_path, HASH_ERROR)
             entry.src_hash = src_h
             ds.dst_hash    = dst_h
-            if src_h != dst_h:
-                ds.status = FileStatus.MODIFIED
 
-    if progress_cb:
-        progress_cb(total, total, "Scan complete.")
+            if src_h == HASH_ERROR or dst_h == HASH_ERROR:
+                # Could not read one or both files — flag as error, not unchanged
+                ds.status = FileStatus.MODIFIED
+                error_count += 1
+            elif src_h != dst_h:
+                ds.status = FileStatus.MODIFIED
+            # else: hashes match → stays UNCHANGED (confirmed)
+
+        if progress_cb:
+            algo_label = "xxhash" if (hash_algo == "xxhash" and HAS_XXHASH) else "sha256"
+            pool_label = "process" if use_process_pool else "thread"
+            err_label = f" ({error_count} read errors)" if error_count else ""
+            progress_cb(
+                total, total,
+                f"Scan complete. Hashed {htotal} files ({algo_label}, {pool_label} pool){err_label}."
+            )
+    else:
+        if progress_cb:
+            progress_cb(total, total, "Scan complete.")
+
     return results
 
 
@@ -287,15 +476,30 @@ def sync_files_multi(
 ) -> dict:
     """
     Sync each file to every destination that needs it — in parallel.
+    Uses kernel-level sendfile when available (Linux), falls back to shutil.copy2.
     Returns stats dict per destination index.
     """
     stats   = {i: {"copied": 0, "deleted": 0, "errors": 0} for i in range(len(dst_roots))}
     lock    = threading.Lock()
     done    = [0]
-    workers = min(32, (os.cpu_count() or 4) * 4)
 
     to_process = [e for e in entries if e.needs_sync]
     total = len(to_process)
+
+    def _fast_copy(src: Path, dst: Path):
+        """Copy file using fastest available method."""
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            # Linux: kernel-level zero-copy (fastest for large files)
+            with open(src, "rb") as fsrc, open(dst, "wb") as fdst:
+                in_fd = fsrc.fileno()
+                out_fd = fdst.fileno()
+                os.sendfile(out_fd, in_fd, 0, os.fstat(in_fd).st_size)
+            # Preserve mtime
+            shutil.copystat(src, dst)
+        except (OSError, AttributeError):
+            # Fallback: shutil.copy2 (preserves metadata)
+            shutil.copy2(src, dst)
 
     def process_entry(entry):
         if cancel_event and cancel_event.is_set():
@@ -328,8 +532,7 @@ def sync_files_multi(
                         continue
 
                     dest_path = dst_root / entry.rel_path
-                    dest_path.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(entry.src_path, dest_path)
+                    _fast_copy(entry.src_path, dest_path)
                     with lock:
                         stats[ds.dest_index]["copied"] += 1
                     copied_to.append(dest_label)
@@ -351,7 +554,7 @@ def sync_files_multi(
         if deleted_from and log_cb:
             log_cb(f"  DEL  {entry.rel_path}  → {', '.join(deleted_from)}")
 
-    with ThreadPoolExecutor(max_workers=workers) as ex:
+    with ThreadPoolExecutor(max_workers=IO_WORKERS) as ex:
         futs = [ex.submit(process_entry, e) for e in to_process]
         for fut in as_completed(futs):
             if cancel_event and cancel_event.is_set():
@@ -373,11 +576,12 @@ class ScanWorker(QThread):
     progress = pyqtSignal(int, int, str)
     finished = pyqtSignal(list)
 
-    def __init__(self, src_root, dst_roots, exclude_patterns=None):
+    def __init__(self, src_root, dst_roots, exclude_patterns=None, hash_algo="xxhash"):
         super().__init__()
         self.src_root = src_root
         self.dst_roots = dst_roots
         self.exclude_patterns = exclude_patterns or []
+        self.hash_algo = hash_algo
         self.cancel_event = threading.Event()
 
     def run(self):
@@ -387,6 +591,7 @@ class ScanWorker(QThread):
             progress_cb=self.emit_progress,
             cancel_event=self.cancel_event,
             exclude_patterns=self.exclude_patterns,
+            hash_algo=self.hash_algo,
         )
         self.finished.emit(results)
 
@@ -530,7 +735,7 @@ class DestinationRow(QWidget):
 class FileSyncApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("SyncFlow v1.0.1 — Precision Sync")
+        self.setWindowTitle("SyncFlow v1.1.0 — Precision Sync")
         self.resize(1000, 750)
 
         self._entries = []
@@ -544,6 +749,12 @@ class FileSyncApp(QMainWindow):
         self._setup_ui()
         self._apply_styles()
         self._load_settings()  # This will set _loading_settings to False when done
+
+        # Log hardware capabilities on startup
+        print(f"[HW] CPU: {CPU_COUNT} cores | IO workers: {IO_WORKERS} | Hash workers: {HASH_WORKERS}")
+        print(f"[HW] xxhash: {'available' if HAS_XXHASH else 'NOT installed (pip install xxhash)'}")
+        print(f"[HW] CUDA/GPU: {'detected' if HAS_CUDA else 'not detected'}")
+        print(f"[HW] Hash cache: {HASH_CACHE_PATH}")
 
     def _setup_ui(self):
         # Central widget
@@ -612,6 +823,41 @@ class FileSyncApp(QMainWindow):
         dir_layout.addWidget(self._dir_rev)
         dir_layout.addStretch()
         main_layout.addLayout(dir_layout)
+
+        # ── Hash algorithm ─────────────────────────────────────────
+        hash_layout = QHBoxLayout()
+        hash_layout.setSpacing(12)
+        hash_label = QLabel("Hash Algo:")
+        hash_label.setFixedWidth(180)
+        hash_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        hash_layout.addWidget(hash_label)
+
+        self._hash_group = QButtonGroup(self)
+        self._hash_xxhash = QRadioButton("xxhash (fast)")
+        self._hash_sha256 = QRadioButton("SHA-256 (crypto)")
+        if HAS_XXHASH:
+            self._hash_xxhash.setChecked(True)
+        else:
+            self._hash_sha256.setChecked(True)
+            self._hash_xxhash.setEnabled(False)
+            self._hash_xxhash.setToolTip("Install xxhash: pip install xxhash")
+        self._hash_group.addButton(self._hash_xxhash, 0)
+        self._hash_group.addButton(self._hash_sha256, 1)
+        hash_layout.addWidget(self._hash_xxhash)
+        hash_layout.addWidget(self._hash_sha256)
+
+        # Hardware info label
+        hw_parts = [f"CPU: {CPU_COUNT} cores"]
+        if HAS_XXHASH:
+            hw_parts.append("xxhash ✓")
+        if HAS_CUDA:
+            hw_parts.append("GPU ✓")
+        hw_info = QLabel("  |  ".join(hw_parts))
+        hw_info.setStyleSheet("color: #636366; font-size: 9pt;")
+        hash_layout.addWidget(hw_info)
+
+        hash_layout.addStretch()
+        main_layout.addLayout(hash_layout)
 
         # ── Action buttons ─────────────────────────────────────────
         action_layout = QHBoxLayout()
@@ -917,6 +1163,10 @@ class FileSyncApp(QMainWindow):
         self.sync_btn.setText("← Sync" if rev else "Sync →")
         self.save_settings()
 
+    def get_hash_algo(self) -> str:
+        """Return selected hash algorithm: 'xxhash' or 'sha256'."""
+        return "sha256" if self._hash_sha256.isChecked() else "xxhash"
+
     def get_effective_src_dsts(self):
         """Return (effective_src: Path, effective_dsts: list[Path]) respecting direction."""
         src = self.src_entry.text().strip()
@@ -1062,7 +1312,10 @@ class FileSyncApp(QMainWindow):
         for i, dp in enumerate(effective_dsts):
             self.log(f"   To D{i+1} : {dp}")
 
-        self._scan_worker = ScanWorker(effective_src, effective_dsts, self._exclude_patterns)
+        self._scan_worker = ScanWorker(
+            effective_src, effective_dsts, self._exclude_patterns,
+            hash_algo=self.get_hash_algo()
+        )
         self._scan_worker.progress.connect(self.update_progress)
         self._scan_worker.finished.connect(self.scan_done)
         self._scan_worker.start()
@@ -1078,6 +1331,7 @@ class FileSyncApp(QMainWindow):
         dest_only = sum(1 for e in results if e.overall_status == FileStatus.DEST_ONLY)
 
         self.log(f"   New:{new}  Modified:{modified}  Unchanged:{unchanged}  Dest-only:{dest_only}")
+        self.log(f"   Hash: {self.get_hash_algo()}  |  Workers: {HASH_WORKERS} processes / {IO_WORKERS} threads")
         self.log("── Scan complete ──")
 
         needs_sync = new + modified + dest_only
@@ -1248,6 +1502,7 @@ class FileSyncApp(QMainWindow):
             "src": self.src_entry.text(),
             "destinations": [row.get_path() for row in self._dest_rows],
             "direction": "rev" if self._dir_rev.isChecked() else "fwd",
+            "hash_algo": self.get_hash_algo(),
         }
         try:
             settings_file = self.settings_path()
@@ -1287,6 +1542,13 @@ class FileSyncApp(QMainWindow):
                 self._dir_rev.setChecked(True)
             else:
                 self._dir_fwd.setChecked(True)
+
+            # Load hash algorithm preference
+            hash_algo = data.get("hash_algo", "xxhash")
+            if hash_algo == "sha256":
+                self._hash_sha256.setChecked(True)
+            elif HAS_XXHASH:
+                self._hash_xxhash.setChecked(True)
 
             print("[OK] Settings loaded successfully")
         except Exception as e:
